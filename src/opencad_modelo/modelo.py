@@ -1601,6 +1601,7 @@ class Modelo:
         paso: float = 1.0,
         timeout: float = 120.0,
         nativo: bool = True,
+        parar=None,
     ):
         """Espera a que pinches una curva y da sus puntos cada `paso`.
 
@@ -1608,6 +1609,7 @@ class Modelo:
         Circle, Arc, Ellipse, Spline) y con puntos estacionados por
         longitud de arco (puntos_curva). Devuelve
         {handle, tipo, capa, puntos} con puntos=[[x, y, z], ...].
+        parar: objeto con is_set() para cancelar desde un dialogo.
         """
         _validar_paso(paso)
         if isinstance(tipos, str):
@@ -1623,6 +1625,8 @@ class Modelo:
         t0 = time.time()
         avisado = None
         while time.time() - t0 < timeout:
+            if parar is not None and parar.is_set():
+                raise RuntimeError("seleccion cancelada")
             sel = self.mcp.tool(
                 "ocs_read", {"ocs_session_id": self.sid, "op": "state"}
             ).get("selection", [])

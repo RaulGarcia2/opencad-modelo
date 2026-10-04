@@ -67,6 +67,280 @@ def _offset_xy(pts, d):
     return out
 
 
+def _validar_paso(paso):
+    if paso is None or paso != paso or paso in (float("inf"), float("-inf")):
+        raise ValueError(f"paso {paso!r}: debe ser finito")
+    if paso <= 0:
+        raise ValueError(f"paso {paso!r}: debe ser > 0")
+    return float(paso)
+
+
+def _vec(p, n=3, default=0.0):
+    """Vector OCS (dict {x,y,z} o lista) -> [float] * n."""
+    if isinstance(p, dict):
+        return [float(p.get(k, default)) for k in ("x", "y", "z")[:n]]
+    return [float(p[i]) if len(p) > i else default for i in range(n)]
+
+
+def _remuestrear(pts, paso, cerrada=False):
+    """[(x, y[, z])] -> [(x, y, z, pk)] cada `paso` (longitud 2D).
+
+    Siempre incluye el inicio (pk 0) y el final; si cerrada, repite el
+    primero al final. z se interpola linealmente.
+    """
+    paso = _validar_paso(paso)
+    P = [(float(p[0]), float(p[1])) for p in pts]
+    Z = [float(p[2]) if len(p) > 2 else 0.0 for p in pts]
+    if len(P) < 2:
+        raise ValueError("se necesitan al menos 2 puntos")
+    npt = len(P)
+    fin = npt if cerrada else npt - 1
+    cum = [0.0]
+    for i in range(fin):
+        a, b = P[i], P[(i + 1) % npt]
+        cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+    total = cum[-1]
+    if total < 1e-12:
+        return [(P[0][0], P[0][1], Z[0], 0.0)]
+
+    def punto_en(s):
+        s = max(0.0, min(float(s), total))
+        for i in range(fin):
+            a, b = P[i], P[(i + 1) % npt]
+            za, zb = Z[i], Z[(i + 1) % npt]
+            if s <= cum[i + 1] + 1e-9 or i == fin - 1:
+                L = cum[i + 1] - cum[i]
+                t = 0.0 if L < 1e-12 else (s - cum[i]) / L
+                return (a[0] + (b[0] - a[0]) * t,
+                        a[1] + (b[1] - a[1]) * t,
+                        za + (zb - za) * t)
+        a, b = P[-1], P[0]
+        return b[0], b[1], Z[0]
+
+    n = max(1, int(math.ceil(total / paso)))
+    out = []
+    for k in range(n + 1):
+        x, y, z = punto_en(total * k / n)
+        out.append((x, y, z, total * k / n))
+    if cerrada and (abs(out[-1][0] - P[0][0]) > 1e-9
+                    or abs(out[-1][1] - P[0][1]) > 1e-9):
+        out.append((P[0][0], P[0][1], Z[0], total))
+    return out
+
+
+def _p3(p):
+    """Punto OCS (dict {x,y,z} o lista) -> (x, y, z) floats."""
+    if isinstance(p, dict):
+        return (float(p.get("x", 0.0)), float(p.get("y", 0.0)),
+                float(p.get("z", 0.0)))
+    return (float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else 0.0)
+
+
+def _catmull_rom_muestrear(fit, por_tramo=16):
+    """fit [(x,y,z)] -> densa [(x,y,z)] con Catmull-Rom centripeta.
+
+    Pasa por todos los puntos; la parametrizacion centripeta evita los
+    sobreimpulsos de la uniforme con puntos desiguales (aproximacion
+    usada cuando OCS solo guarda fit_points, sin poligono de control).
+    """
+    pts = [_p3(p) for p in fit]
+    if len(pts) < 2:
+        raise ValueError("se necesitan al menos 2 fit-points")
+    if len(pts) == 2:
+        return [pts[0], pts[1]]
+
+    def chdist(a, b):
+        return math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) ** 0.5
+
+    ext = [pts[0]] + pts + [pts[-1]]
+    out = [pts[0]]
+    for i in range(1, len(ext) - 2):
+        p0, p1, p2, p3 = ext[i - 1], ext[i], ext[i + 1], ext[i + 2]
+        t0 = 0.0
+        t1 = t0 + chdist(p0, p1)
+        t2 = t1 + chdist(p1, p2)
+        t3 = t2 + chdist(p2, p3)
+        if t1 <= 1e-12 or t2 - t1 <= 1e-12 or t3 - t2 <= 1e-12:
+            for k in range(1, por_tramo + 1):  # tramo degenerado: recta
+                t = k / por_tramo
+                out.append(tuple(p1[d] + (p2[d] - p1[d]) * t for d in range(3)))
+            continue
+        for k in range(1, por_tramo + 1):
+            t = t1 + (t2 - t1) * k / por_tramo
+
+            def lerp(pa, pb, ta, tb):
+                f = 0.0 if abs(tb - ta) < 1e-12 else (t - ta) / (tb - ta)
+                return tuple(pa[d] + (pb[d] - pa[d]) * f for d in range(3))
+
+            a1 = lerp(p0, p1, t0, t1)
+            a2 = lerp(p1, p2, t1, t2)
+            a3 = lerp(p2, p3, t2, t3)
+            b1 = lerp(a1, a2, t0, t2)
+            b2 = lerp(a2, a3, t1, t3)
+            out.append(lerp(b1, b2, t1, t2))
+    return out
+
+
+def _nurbs_muestrear(cps, degree, knots, weights, n_muestras=None):
+    """De Boor racional. knots None/vacio -> uniformes clamped.
+
+    cps: [(x,y,z)], degree int, knots [float], weights [float]|None.
+    Devuelve densa [(x,y,z)] en el dominio [U[p], U[m+1]].
+    """
+    P = [_p3(p) for p in cps]
+    m = len(P) - 1
+    p = int(degree)
+    if not 1 <= p <= m:
+        raise ValueError(f"degree {degree!r} no valido para {m + 1} puntos")
+    W = [float(w) for w in weights] if weights else [1.0] * (m + 1)
+    if len(W) != m + 1:
+        raise ValueError("weights debe tener un valor por punto de control")
+    if knots and len(knots) == m + p + 2:
+        U = [float(u) for u in knots]
+    else:  # uniformes clamped en [0, 1]
+        U = [0.0] * (p + 1) + [i / (m - p + 1) for i in range(1, m - p + 1)
+                               ] + [1.0] * (p + 1)
+    for a, b in zip(U, U[1:]):
+        if b < a - 1e-12:
+            raise ValueError("knots debe ser no decreciente")
+    u0, u1 = U[p], U[m + 1]
+    if u1 <= u0:
+        raise ValueError("dominio de knots degenerado")
+    n = n_muestras or max(32, 16 * (m + 1))
+    H = [(x * w, y * w, z * w, w) for (x, y, z), w in zip(P, W)]
+
+    def evaluar(u):
+        u = max(u0, min(float(u), u1))
+        k = p
+        while k < m and u >= U[k + 1] - 1e-12:
+            k += 1
+        d = [list(H[j]) for j in range(k - p, k + 1)]
+        for r in range(1, p + 1):
+            for j in range(p, r - 1, -1):
+                jj = j + k - p
+                den = U[jj + p - r + 1] - U[jj]
+                a = 0.0 if abs(den) < 1e-12 else (u - U[jj]) / den
+                for c in range(4):
+                    d[j][c] = (1 - a) * d[j - 1][c] + a * d[j][c]
+        x, y, z, w = d[p]
+        if abs(w) < 1e-12:
+            raise ValueError("peso nulo en la evaluacion NURBS")
+        return x / w, y / w, z / w
+
+    return [evaluar(u0 + (u1 - u0) * k / (n - 1)) for k in range(n)]
+
+
+def _fuente_spline(props):
+    """Elige representacion de spline: ("nurbs", args) o ("catmull", fit).
+
+    Prefiere NURBS exacta con control+knots coherentes; si no, Catmull-Rom
+    por fit_points. Las periodicas sin datos para evaluarlas se rechazan.
+    """
+    flags = props.get("flags") or {}
+    cps = props.get("control_points") or []
+    knots = props.get("knots") or []
+    deg = props.get("degree", 3)
+    weights = props.get("weights") or None
+    fit = props.get("fit_points") or []
+    periodica = bool(flags.get("periodic"))
+    if cps and len(cps) >= 2 and knots and len(knots) == len(cps) + int(deg) + 1:
+        if periodica:
+            raise ValueError("spline periodica no soportada")
+        return "nurbs", (cps, deg, knots, weights)
+    if fit and len(fit) >= 2:
+        return "catmull", (fit,)
+    if cps and len(cps) >= 2 and not periodica:
+        return "nurbs", (cps, deg, None, weights)
+    raise ValueError("spline sin datos evaluables (ni knots+control "
+                     "coherentes ni fit_points)")
+
+
+_MAX_PUNTOS_NATIVOS = 3000
+
+
+def _coords_punto(ent):
+    """Coordenadas de una entidad POINT leida por query."""
+    for k in ("location", "position", "point", "insertion"):
+        v = ent.get(k)
+        if v is not None:
+            return _vec(v)
+    raise ValueError(f"POINT sin coordenadas conocidas: {sorted(ent)}")
+
+
+def _desenvolver(a, ref):
+    """Angulo equivalente a `a` que sea >= ref (sumando 2*pi)."""
+    while a < ref:
+        a += 2 * math.pi
+    return a
+
+
+def _circulo_estaciones(c, r, paso):
+    """Centro [x,y,z], radio -> [(x,y,z,pk)] cerrado (repite el primero).
+
+    Estaciones por angulo: pk exactos (longitud 2*pi*r) y puntos sobre
+    la circunferencia (sin error de cuerda).
+    """
+    paso = _validar_paso(paso)
+    r = float(r)
+    if r != r or r in (float("inf"), float("-inf")) or r <= 0.0:
+        raise ValueError(f"Radio {r!r}: debe ser finito y > 0")
+    total = 2 * math.pi * r
+    n = max(8, int(math.ceil(total / paso)))
+    out = [(c[0] + r * math.cos(2 * math.pi * k / n),
+            c[1] + r * math.sin(2 * math.pi * k / n),
+            c[2], total * k / n) for k in range(n)]
+    out.append((c[0] + r, c[1], c[2], total))
+    return out
+
+
+def _arco_estaciones(c, r, a0, a1, paso):
+    """Arco antihorario a0->a1 (radianes) -> [(x,y,z,pk)] con extremos.
+
+    Estaciones por angulo: pk exactos (longitud r*barrido).
+    """
+    paso = _validar_paso(paso)
+    r = float(r)
+    if r != r or r in (float("inf"), float("-inf")) or r <= 0.0:
+        raise ValueError(f"Radio {r!r}: debe ser finito y > 0")
+    a0, a1 = float(a0), float(a1)
+    while a1 <= a0:
+        a1 += 2 * math.pi
+    total = r * (a1 - a0)
+    n = max(1, int(math.ceil(total / paso)))
+    return [(c[0] + r * math.cos(a0 + (a1 - a0) * k / n),
+             c[1] + r * math.sin(a0 + (a1 - a0) * k / n),
+             c[2], total * k / n) for k in range(n + 1)]
+
+
+def _elipse_estaciones(c, mayor, ratio, a0, a1, paso):
+    """Elipse paramétrica -> [(x,y,z,pk)]; anillo completo repite el primero.
+    mayor: vector semieje mayor [x,y(,z)]; ratio = menor/mayor."""
+    paso = _validar_paso(paso)
+    ratio = float(ratio)
+    if not 0.0 < ratio <= 1.0 + 1e-9:
+        raise ValueError(f"minor_axis_ratio {ratio!r}: debe estar en (0, 1]")
+    rmax = math.hypot(float(mayor[0]), float(mayor[1]))
+    if rmax < 1e-12:
+        raise ValueError("semieje mayor degenerado")
+    ux, uy = float(mayor[0]) / rmax, float(mayor[1]) / rmax
+    nx, ny = -uy, ux
+    a0, a1 = float(a0), float(a1)
+    completa = abs(a1 - a0) < 1e-9
+    if completa:
+        a1 = a0 + 2 * math.pi
+    while a1 <= a0:
+        a1 += 2 * math.pi
+    n = max(32, int(math.ceil(rmax * (a1 - a0) / (paso / 8))))
+    pts = []
+    for k in range(n + (0 if completa else 1)):
+        a = a0 + (a1 - a0) * k / n
+        ca, sa = math.cos(a), math.sin(a)
+        pts.append((c[0] + rmax * ca * ux + rmax * ratio * sa * nx,
+                    c[1] + rmax * ca * uy + rmax * ratio * sa * ny,
+                    c[2]))
+    return _remuestrear(pts, paso, cerrada=completa)
+
+
 def _estacionar(vertices, paso, cerrada=False):
     """Puntos cada `paso` a lo largo de una polilinea con arcos.
 
@@ -858,6 +1132,385 @@ class Modelo:
         )
         return [[x, y, z] for x, y, _ in est]
 
+    def puntos_curva(self, handle, paso: float):
+        """Puntos cada `paso` a lo largo de una curva (sin tocar el dibujo).
+
+        Line, Polyline (delega en puntos_polilinea), Circle, Arc,
+        Ellipse y Spline (fit_points por Catmull-Rom o control+knots
+        por NURBS exacta). Devuelve [[x, y, z], ...] con pk 0, paso,
+        2*paso... mas siempre el punto final; las cerradas (circulo,
+        elipse completa) repiten el primero al final.
+        """
+        _validar_paso(paso)
+        h = _hs(handle)[0]
+        rec = self.mcp.tool(
+            "ocs_read",
+            {"ocs_session_id": self.sid, "op": "records",
+             "parameters": {"collection": "entities", "handles": [h]}},
+        )
+        recs = rec.get("records", [])
+        if not recs:
+            raise ValueError(f"puntos_curva: la entidad {h} no existe")
+        tipo = str(recs[0].get("record_type", "")
+                   or recs[0].get("type", "")).upper()
+        props = recs[0].get("properties", {})
+        est, nombre = None, tipo
+        if "POLYLINE" in tipo:
+            return self.puntos_polilinea(h, paso)
+        if tipo == "LINE":
+            q = self.mcp.tool(
+                "ocs_read",
+                {"ocs_session_id": self.sid, "op": "query",
+                 "parameters": {"handles": [h], "detail": "geometry",
+                                "limit": 1}},
+            )
+            ents = q.get("entities", [])
+            if not ents:
+                raise ValueError(f"puntos_curva: la entidad {h} no existe")
+            s, e = _vec(ents[0]["start"]), _vec(ents[0]["end"])
+            est = _remuestrear([s, e], paso)
+            nombre = "Linea"
+        elif tipo == "CIRCLE":
+            c = _vec(props.get("center", [0, 0, 0]))
+            est = _circulo_estaciones(c, props.get("radius", 0), paso)
+            nombre = "Circulo"
+        elif tipo == "ARC":
+            c = _vec(props.get("center", [0, 0, 0]))
+            est = _arco_estaciones(c, props.get("radius", 0),
+                                   props.get("start_angle", 0),
+                                   props.get("end_angle", 0), paso)
+            nombre = "Arco"
+        elif tipo == "ELLIPSE":
+            c = _vec(props.get("center", [0, 0, 0]))
+            est = _elipse_estaciones(
+                c, _vec(props.get("major_axis", [1, 0, 0])),
+                props.get("minor_axis_ratio", 1.0),
+                props.get("start_parameter", 0.0),
+                props.get("end_parameter", 0.0), paso)
+            nombre = "Elipse"
+        elif tipo == "SPLINE":
+            modo, args = _fuente_spline(props)
+            if modo == "nurbs":
+                densa = _nurbs_muestrear(*args)
+            else:
+                densa = _catmull_rom_muestrear(*args)
+            cerrada = False
+            if len(densa) > 2 and math.hypot(
+                    densa[0][0] - densa[-1][0],
+                    densa[0][1] - densa[-1][1]) < 1e-9:
+                cerrada = True
+            est = _remuestrear(densa, paso, cerrada=cerrada)
+            nombre = "Spline"
+        else:
+            raise ValueError(
+                f"puntos_curva: {h} es {tipo or 'desconocido'} "
+                "(Line, Polyline, Circle, Arc, Ellipse, Spline)")
+        print(f"{nombre} {h}: {len(est)} puntos cada {paso} "
+              f"(longitud {est[-1][3]:.3f})")
+        return [[x, y, z] for x, y, z, _ in est]
+
+    def puntos_curva(self, handle, paso: float, nativo: bool = True):
+        """Puntos cada `paso` a lo largo de una curva.
+
+        Line y Polyline: calculo puro exacto (solo lectura).
+        Circle, Arc, Ellipse y Spline: con nativo=True (defecto) usa el
+        kernel por MEASURE (puntos exactos sobre la curva; crea y borra
+        POINT temporales, asi que marca el dibujo como modificado); con
+        nativo=False usa el calculo puro local. Devuelve [[x, y, z], ...]
+        con pk 0, paso, 2*paso... mas siempre el punto final; las
+        cerradas (circulo, elipse completa) repiten el primero al final.
+        """
+        _validar_paso(paso)
+        h = _hs(handle)[0]
+        rec = self.mcp.tool(
+            "ocs_read",
+            {"ocs_session_id": self.sid, "op": "records",
+             "parameters": {"collection": "entities", "handles": [h]}},
+        )
+        recs = rec.get("records", [])
+        if not recs:
+            raise ValueError(f"puntos_curva: la entidad {h} no existe")
+        tipo = str(recs[0].get("record_type", "")
+                   or recs[0].get("type", "")).upper()
+        props = recs[0].get("properties", {})
+        est, nombre = None, tipo
+        if "POLYLINE" in tipo:
+            return self.puntos_polilinea(h, paso)
+        if tipo == "LINE":
+            q = self.mcp.tool(
+                "ocs_read",
+                {"ocs_session_id": self.sid, "op": "query",
+                 "parameters": {"handles": [h], "detail": "geometry",
+                                "limit": 1}},
+            )
+            ents = q.get("entities", [])
+            if not ents:
+                raise ValueError(f"puntos_curva: la entidad {h} no existe")
+            s, e = _vec(ents[0]["start"]), _vec(ents[0]["end"])
+            est = _remuestrear([s, e], paso)
+            nombre = "Linea"
+        elif tipo in ("CIRCLE", "ARC", "ELLIPSE", "SPLINE"):
+            if nativo:
+                est = self._puntos_nativos(h, tipo, props, paso)
+                if est is None:
+                    print(f"  nativo no viable: calculo puro")
+            if est is None:
+                est = self._puntos_puros(tipo, props, h, paso)
+            nombre = {"CIRCLE": "Circulo", "ARC": "Arco",
+                      "ELLIPSE": "Elipse", "SPLINE": "Spline"}[tipo]
+        else:
+            raise ValueError(
+                f"puntos_curva: {h} es {tipo or 'desconocido'} "
+                "(Line, Polyline, Circle, Arc, Ellipse, Spline)")
+        print(f"{nombre} {h}: {len(est)} puntos cada {paso} "
+              f"(longitud {est[-1][3]:.3f})")
+        return [[x, y, z] for x, y, z, _ in est]
+
+    def _puntos_puros(self, tipo, props, h, paso):
+        """Estaciones calculadas en local. Devuelve [(x, y, z, pk)]."""
+        if tipo == "CIRCLE":
+            c = _vec(props.get("center", [0, 0, 0]))
+            return _circulo_estaciones(c, props.get("radius", 0), paso)
+        if tipo == "ARC":
+            c = _vec(props.get("center", [0, 0, 0]))
+            return _arco_estaciones(c, props.get("radius", 0),
+                                    props.get("start_angle", 0),
+                                    props.get("end_angle", 0), paso)
+        if tipo == "ELLIPSE":
+            c = _vec(props.get("center", [0, 0, 0]))
+            return _elipse_estaciones(
+                c, _vec(props.get("major_axis", [1, 0, 0])),
+                props.get("minor_axis_ratio", 1.0),
+                props.get("start_parameter", 0.0),
+                props.get("end_parameter", 0.0), paso)
+        modo, args = _fuente_spline(props)
+        if modo == "nurbs":
+            densa = _nurbs_muestrear(*args)
+        else:
+            densa = _catmull_rom_muestrear(*args)
+        cerrada = False
+        if len(densa) > 2 and math.hypot(
+                densa[0][0] - densa[-1][0],
+                densa[0][1] - densa[-1][1]) < 1e-9:
+            cerrada = True
+        return _remuestrear(densa, paso, cerrada=cerrada)
+
+    def _longitud_exacta(self, h):
+        """Longitud del kernel (read-only) o None si no la da."""
+        q = self.mcp.tool(
+            "ocs_read",
+            {"ocs_session_id": self.sid, "op": "measure",
+             "parameters": {"handles": [h]}},
+        )
+        for m in q.get("measurements", []):
+            curva = (m.get("curve") or {})
+            if "length" in curva and curva["length"] is not None:
+                return float(curva["length"])
+        return None
+
+    def _pick_inicial(self, tipo, props):
+        """Punto exacto sobre la curva por donde empezar a medir."""
+        if tipo == "CIRCLE":
+            c = _vec(props.get("center", [0, 0, 0]))
+            r = float(props.get("radius", 0))
+            return [c[0] + r, c[1], c[2]]
+        if tipo == "ARC":
+            c = _vec(props.get("center", [0, 0, 0]))
+            r = float(props.get("radius", 0))
+            a0 = float(props.get("start_angle", 0))
+            return [c[0] + r * math.cos(a0), c[1] + r * math.sin(a0), c[2]]
+        if tipo == "ELLIPSE":
+            c = _vec(props.get("center", [0, 0, 0]))
+            ma = _vec(props.get("major_axis", [1, 0, 0]))
+            ratio = float(props.get("minor_axis_ratio", 1.0))
+            a0 = float(props.get("start_parameter", 0.0))
+            rmax = math.hypot(ma[0], ma[1])
+            ux, uy = ma[0] / rmax, ma[1] / rmax
+            return [c[0] + rmax * math.cos(a0) * ux
+                    + rmax * ratio * math.sin(a0) * -uy,
+                    c[1] + rmax * math.cos(a0) * uy
+                    + rmax * ratio * math.sin(a0) * ux, c[2]]
+        fit = props.get("fit_points") or []
+        if fit:
+            return _vec(fit[0])
+        cps = props.get("control_points") or []
+        if cps:
+            return _vec(cps[0])
+        raise ValueError("sin punto inicial sobre la curva")
+
+    def _puntos_nativos(self, h, tipo, props, paso):
+        """Estaciones del kernel por MEASURE. [(x, y, z, pk)] o None.
+
+        Crea POINT temporales cada `paso` y los borra en finally.
+        None = no viable (sin longitud, demasiados puntos) -> via pura.
+        """
+        total = self._longitud_exacta(h)
+        if total is None or total <= 1e-12:
+            return None
+        if int(total // paso) > _MAX_PUNTOS_NATIVOS:
+            return None
+        pick = self._pick_inicial(tipo, props)
+        antes = self._todos_handles()
+        nuevos = []
+        try:
+            resp = self.mcp.execute(
+                self.sid,
+                {"op": "start", "request_id": self.mcp.nuevo_id("ej"),
+                 "document_id": self.doc_id, "cmd": "MEASURE"},
+                detail="full",
+            )
+            cmd = (resp.get("state") or {}).get("command") or {}
+            if "entity" not in cmd.get("accepts", []):
+                raise RuntimeError(f"MEASURE no arranco: {resp}")
+            resp = self.mcp.execute(
+                self.sid,
+                {"op": "input", "request_id": self.mcp.nuevo_id("ej"),
+                 "document_id": self.doc_id, "kind": "entity",
+                 "handle": h, "point": [float(pick[0]), float(pick[1]),
+                                        float(pick[2])]},
+                detail="full",
+            )
+            cmd = (resp.get("state") or {}).get("command") or {}
+            if "token" not in cmd.get("accepts", []):
+                raise RuntimeError(f"MEASURE no pidio longitud: {resp}")
+            resp = self.mcp.execute(
+                self.sid,
+                {"op": "input", "request_id": self.mcp.nuevo_id("ej"),
+                 "document_id": self.doc_id, "kind": "token",
+                 "text": _fmt_num(paso)},
+                detail="full",
+            )
+            if resp.get("status") != "completed":
+                raise RuntimeError(f"MEASURE no completo: {resp}")
+            nuevos = self._ordenar_handles(self._todos_handles() - antes)
+            if not nuevos:
+                return None
+            q = self.mcp.tool(
+                "ocs_read",
+                {"ocs_session_id": self.sid, "op": "query",
+                 "parameters": {"handles": nuevos, "detail": "geometry",
+                                "limit": len(nuevos)}},
+            )
+            medidos = []
+            for e in q.get("entities", []):
+                try:
+                    medidos.append(_coords_punto(e))
+                except ValueError:
+                    pass
+            if not medidos:
+                return None
+            return self._ordenar_medidos(tipo, props, pick, medidos, total)
+        finally:
+            if nuevos:
+                try:
+                    self.mcp.execute(
+                        self.sid,
+                        {"op": "entities_delete",
+                         "request_id": self.mcp.nuevo_id("ej"),
+                         "document_id": self.doc_id, "handles": nuevos},
+                    )
+                except Exception:
+                    pass
+
+    def _ordenar_medidos(self, tipo, props, pick, medidos, total):
+        """Medidos -> [(x, y, z, pk)] ordenados desde el inicio + final."""
+        if tipo == "CIRCLE":
+            c = _vec(props.get("center", [0, 0, 0]))
+            clave = lambda p: _desenvolver(
+                math.atan2(p[1] - c[1], p[0] - c[0]), 0.0)
+            r = float(props.get("radius", 0))
+            ini = [c[0] + r, c[1], c[2]]
+        elif tipo == "ARC":
+            c = _vec(props.get("center", [0, 0, 0]))
+            a0 = float(props.get("start_angle", 0))
+            a1 = a0
+            while a1 <= a0:
+                a1 += 2 * math.pi
+            r = float(props.get("radius", 0))
+            clave = lambda p: _desenvolver(
+                math.atan2(p[1] - c[1], p[0] - c[0]), a0)
+            ini = [c[0] + r * math.cos(a0), c[1] + r * math.sin(a0), c[2]]
+            total = r * (a1 - a0)
+        elif tipo == "ELLIPSE":
+            c = _vec(props.get("center", [0, 0, 0]))
+            ma = _vec(props.get("major_axis", [1, 0, 0]))
+            rmax = math.hypot(ma[0], ma[1])
+            ux, uy = ma[0] / rmax, ma[1] / rmax
+            a0 = float(props.get("start_parameter", 0.0))
+            a1 = float(props.get("end_parameter", 0.0))
+            if abs(a1 - a0) < 1e-9:
+                a1 = a0 + 2 * math.pi
+            while a1 <= a0:
+                a1 += 2 * math.pi
+
+            def clave(p):
+                dx, dy = p[0] - c[0], p[1] - c[1]
+                return _desenvolver(math.atan2(dx * uy - dy * ux,
+                                               dx * ux + dy * uy), a0)
+
+            ini = [c[0] + rmax * math.cos(a0) * ux,
+                   c[1] + rmax * math.cos(a0) * uy, c[2]]
+        else:  # SPLINE: encadenado avaro desde el inicio
+            ini = list(pick)
+            resto = [list(p) for p in medidos]
+            orden = []
+            actual = list(pick)
+            while resto:
+                j = min(range(len(resto)),
+                        key=lambda i: (resto[i][0] - actual[0]) ** 2
+                        + (resto[i][1] - actual[1]) ** 2
+                        + (resto[i][2] - actual[2]) ** 2)
+                actual = resto.pop(j)
+                orden.append(actual)
+            return self._con_extremos(orden, ini, tipo, props)
+        orden = sorted(medidos, key=clave)
+        return self._con_extremos(orden, ini, tipo, props)
+
+    def _con_extremos(self, orden, ini, tipo, props):
+        """Anade inicio/fin exactos (sin duplicar) y rellen pk."""
+        pts = [list(ini)]
+        for p in orden:
+            if math.dist(p, pts[-1]) > 1e-9:
+                pts.append(list(p))
+        if tipo == "CIRCLE":
+            fin = list(ini)
+        elif tipo == "ARC":
+            c = _vec(props.get("center", [0, 0, 0]))
+            r = float(props.get("radius", 0))
+            a1 = float(props.get("end_angle", 0))
+            a0 = float(props.get("start_angle", 0))
+            while a1 <= a0:
+                a1 += 2 * math.pi
+            fin = [c[0] + r * math.cos(a1), c[1] + r * math.sin(a1), c[2]]
+        elif tipo == "ELLIPSE":
+            c = _vec(props.get("center", [0, 0, 0]))
+            ma = _vec(props.get("major_axis", [1, 0, 0]))
+            ratio = float(props.get("minor_axis_ratio", 1.0))
+            rmax = math.hypot(ma[0], ma[1])
+            ux, uy = ma[0] / rmax, ma[1] / rmax
+            nx, ny = -uy, ux
+            a1 = float(props.get("end_parameter", 0.0))
+            a0 = float(props.get("start_parameter", 0.0))
+            if abs(a1 - a0) < 1e-9:
+                a1 = a0 + 2 * math.pi
+            while a1 <= a0:
+                a1 += 2 * math.pi
+            fin = [c[0] + rmax * math.cos(a1) * ux
+                   + rmax * ratio * math.sin(a1) * nx,
+                   c[1] + rmax * math.cos(a1) * uy
+                   + rmax * ratio * math.sin(a1) * ny, c[2]]
+        else:
+            fit = props.get("fit_points") or props.get("control_points") or []
+            fin = _vec(fit[-1]) if fit else list(pts[-1])
+        if math.dist(fin, pts[-1]) > 1e-9:
+            pts.append(fin)
+        out, acum = [], 0.0
+        for i, (x, y, z) in enumerate(pts):
+            if i:
+                acum += math.dist((x, y, z), pts[i - 1])
+            out.append((x, y, z, acum))
+        return out
+
     def _tipo_de(self, h):
         """Tipo (ui_name) de una entidad, o None si no existe."""
         q = self.mcp.tool(
@@ -914,6 +1567,83 @@ class Modelo:
                     )
                     capa = (q.get("entities") or [{}])[0].get("layer", "")
                     puntos = self._puntos_de(h)
+                    try:  # deseleccionar
+                        self.mcp.execute(
+                            self.sid,
+                            {
+                                "op": "select",
+                                "request_id": self.mcp.nuevo_id("ej"),
+                                "document_id": self.doc_id,
+                                "clear": True,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    print(
+                        f"Seleccionado {tipo} {h} ({len(puntos)} puntos, capa {capa})"
+                    )
+                    return {"handle": h, "tipo": tipo, "capa": capa, "puntos": puntos}
+                clave = ("tipo", tipo)
+                if clave != avisado:
+                    print(f"  Eso es un '{tipo}': necesito {etiqueta}")
+                    avisado = clave
+            elif len(sel) > 1:
+                clave = ("varias", len(sel))
+                if clave != avisado:
+                    print(f"  Hay {len(sel)} seleccionados: deja solo uno")
+                    avisado = clave
+            time.sleep(1.0)
+        raise TimeoutError("Sin seleccion tras el timeout.")
+
+    def seleccionar_coordenadas_curva(
+        self,
+        tipos=("Line", "Polyline", "Circle", "Arc", "Ellipse", "Spline"),
+        paso: float = 1.0,
+        timeout: float = 120.0,
+        nativo: bool = True,
+    ):
+        """Espera a que pinches una curva y da sus puntos cada `paso`.
+
+        Como seleccionar_coordenadas pero para curvas (Line, Polyline,
+        Circle, Arc, Ellipse, Spline) y con puntos estacionados por
+        longitud de arco (puntos_curva). Devuelve
+        {handle, tipo, capa, puntos} con puntos=[[x, y, z], ...].
+        """
+        _validar_paso(paso)
+        if isinstance(tipos, str):
+            tipos = [tipos]
+        aceptados = {str(t).strip().lower() for t in tipos}
+        if "polyline" in aceptados:
+            aceptados |= {"lwpolyline", "polyline2d", "polyline3d"}
+        etiqueta = "/".join(sorted(aceptados))
+        print(
+            f"Pincha una {etiqueta} en OpenCADStudio "
+            f"(espero hasta {timeout:.0f} s, Ctrl+C para salir)..."
+        )
+        t0 = time.time()
+        avisado = None
+        while time.time() - t0 < timeout:
+            sel = self.mcp.tool(
+                "ocs_read", {"ocs_session_id": self.sid, "op": "state"}
+            ).get("selection", [])
+            if len(sel) == 1:
+                tipo = self._tipo_de(sel[0])
+                if tipo and tipo.lower() in aceptados:
+                    h = sel[0]
+                    q = self.mcp.tool(
+                        "ocs_read",
+                        {
+                            "ocs_session_id": self.sid,
+                            "op": "query",
+                            "parameters": {
+                                "handles": [h],
+                                "detail": "summary",
+                                "limit": 1,
+                            },
+                        },
+                    )
+                    capa = (q.get("entities") or [{}])[0].get("layer", "")
+                    puntos = self.puntos_curva(h, paso, nativo=nativo)
                     try:  # deseleccionar
                         self.mcp.execute(
                             self.sid,

@@ -9,6 +9,14 @@ servidor **MCP** (sin dependencias externas; solo la librería estándar).
 pip install -e .
 ```
 
+O directamente desde GitHub (sin clonar):
+
+```sh
+pip install "git+https://github.com/RaulGarcia2/opencad-modelo.git"
+# fijando versión:
+pip install "git+https://github.com/RaulGarcia2/opencad-modelo.git@v0.3.3"
+```
+
 ## Uso
 
 ```python

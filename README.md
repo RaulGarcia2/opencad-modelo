@@ -30,6 +30,9 @@ with Modelo() as m:                       # conecta con el dibujo en pantalla
     m.texto("Hola MCP", [10, 45, 0], altura=5, capa="capaRuta")
     m.textos([("a", [0, 0]), ("b", [0, 10])], "capaRuta", color=2)
     h2 = m.cambiar_propiedades(h, color=1, grosor=0.5, estilo="DASHED")
+    hs = m.crear_lote([("pline", [[0, 0], [10, 0], [10, 10]], True),
+                       ("circulo", [5, 5], 1)], "capaRuta")  # lote rapido
+    m.agrupar(hs, "grupo1"); m.borrar(hs)
     m.paralela(h, 3)                      # paralela a la derecha (+dcha / -izda)
     m.circulo([50, 25], 20, "capaRuta")   # circulo por centro y radio
     m.arco_3p([0, 0], [50, 20], [100, 0]) # arco por 3 puntos

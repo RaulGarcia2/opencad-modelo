@@ -971,6 +971,93 @@ class Modelo:
         return self._aplicar_propiedades(hs, color, grosor, estilo,
                                          tolerante=True)
 
+    def borrar(self, handles):
+        """Borra entidades por handle. Devuelve la lista de handles."""
+        hs = _hs(handles)
+        if not hs:
+            return []
+        self.mcp.execute(
+            self.sid,
+            {
+                "op": "entities_delete",
+                "request_id": self.mcp.nuevo_id("ej"),
+                "document_id": self.doc_id,
+                "handles": hs,
+            },
+        )
+        print(f"{len(hs)} entidades borradas")
+        return hs
+
+    def agrupar(self, handles, nombre: str):
+        """Agrupa handles en un grupo OCS. Devuelve el nombre del grupo."""
+        hs = _hs(handles)
+        sc = self.mcp.execute(
+            self.sid,
+            {
+                "op": "group_create",
+                "request_id": self.mcp.nuevo_id("ej"),
+                "document_id": self.doc_id,
+                "handles": hs,
+                "name": nombre,
+            },
+            detail="compact",
+        )
+        grupo = sc.get("result", {}).get("group", nombre)
+        print(f"Grupo '{grupo}' con {len(hs)} entidades")
+        return grupo
+
+    def crear_lote(self, figuras, capa: str = ""):
+        """Crea varias entidades en un solo batch. Rapido (preview).
+
+        figuras: lista de ("pline", puntos[, cerrar]) o
+        ("circulo", centro, radio). Con cerrar=True se duplica el
+        primer vertice: entities_create ignora is_closed, asi que el
+        cierre es visual (igual que hacia la app hasta ahora).
+        La capa se asegura (existe o se crea). Inmune al contagio de
+        la seleccion. Devuelve [handles] en orden.
+        """
+        if not figuras:
+            return []
+        real = self._asegurar_capa(capa) if capa else ""
+        entidades = []
+        for fig in figuras:
+            kind = fig[0]
+            if kind == "pline":
+                _pts, cerrar = fig[1], len(fig) > 2 and fig[2]
+                co = [[float(p[0]), float(p[1])] for p in _pts]
+                if len(co) < 2:
+                    raise ValueError("Polilinea necesita al menos 2 puntos")
+                if cerrar and (
+                    abs(co[0][0] - co[-1][0]) > 1e-9
+                    or abs(co[0][1] - co[-1][1]) > 1e-9
+                ):
+                    co.append(list(co[0]))
+                entidades.append({"type": "LwPolyline", "vertices": co,
+                                  "is_closed": bool(cerrar), "layer": real})
+            elif kind == "circulo":
+                centro, radio = fig[1], float(fig[2])
+                r = radio
+                if r != r or r in (float("inf"), float("-inf")) or r <= 0.0:
+                    raise ValueError(f"Radio {fig[2]!r}: debe ser finito y > 0")
+                entidades.append({"type": "Circle",
+                                  "center": [float(centro[0]), float(centro[1]), 0.0],
+                                  "radius": r, "layer": real})
+            else:
+                raise ValueError(f"Figura {kind!r}: usa 'pline' o 'circulo'")
+        sc = self.mcp.execute(
+            self.sid,
+            {
+                "op": "entities_create",
+                "request_id": self.mcp.nuevo_id("ej"),
+                "document_id": self.doc_id,
+                "entities": entidades,
+            },
+            detail="compact",
+        )
+        hs = sc.get("result", {}).get("handles", [])
+        print(f"Lote: {len(hs)} entidades en '{real}'")
+        return hs
+
     # -- modificar -----------------------------------------------------
     def _todos_handles(self):
         q = self.mcp.tool(
@@ -1947,11 +2034,13 @@ class Modelo:
         return handles[0]
 
     def polilinea(self, puntos: list, capa: str = "", color=None,
-                  grosor: float = None, estilo: str = None):
+                  grosor: float = None, estilo: str = None, cerrar: bool = False):
         """Dibuja PLINE por los puntos. Devuelve el handle.
 
         color/grosor/estilo fijan la propiedad propia de la entidad;
         lo que sea None hereda de la capa. grosor en mm (p. ej. 0.5).
+        cerrar=True anade el token C: polilinea cerrada de verdad
+        (is_closed) sin necesidad de duplicar el primer vertice.
 
         Con >~200 vertices el diario de geometria (cap 256) expulsa la
         epoca inicial y changed_entities viene vacio aunque la entidad
@@ -1963,6 +2052,8 @@ class Modelo:
         if len(puntos) < 2:
             raise ValueError("Polilinea necesita al menos 2 puntos")
         cmd = "PLINE " + " ".join(_fmt_punto(p) for p in puntos)
+        if cerrar:
+            cmd += " C"
         antes = self._todos_handles()
         previa = self._seleccion_actual()
         self._seleccion_limpiar()

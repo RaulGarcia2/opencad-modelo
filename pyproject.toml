@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opencad-modelo"
-version = "0.4.1"
+version = "0.4.2"
 description = "Fachada simple para dibujar en OpenCADStudio via MCP"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }

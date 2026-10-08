@@ -469,6 +469,32 @@ def _color_valor(color):
     raise ValueError(f"Color {color!r} no valido: usa indice ACI (int) o tupla RGB")
 
 
+# Grosores estandar DXF en mm (se guardan en centesimas de mm).
+_GROSOR_STD = (0.00, 0.05, 0.09, 0.13, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35,
+               0.40, 0.50, 0.53, 0.60, 0.70, 0.80, 0.90, 1.00, 1.06, 1.20,
+               1.40, 1.58, 2.00, 2.11)
+
+
+def _grosor_valor(grosor):
+    """Normaliza grosor en mm a centesimas de mm (int DXF)."""
+    if isinstance(grosor, bool) or not isinstance(grosor, (int, float)):
+        raise ValueError(f"Grosor {grosor!r} no valido: usa mm, p. ej. 0.5")
+    cent = int(round(float(grosor) * 100))
+    if cent not in {int(round(g * 100)) for g in _GROSOR_STD}:
+        validos = ", ".join(f"{g:.2f}" for g in _GROSOR_STD)
+        raise ValueError(f"Grosor {grosor} mm no estandar. Usa uno de: {validos}")
+    return cent
+
+
+def _color_record(color):
+    """Normaliza color a valor de record: ACI -> {Index:n}, RGB -> {Rgb:{...}}."""
+    valor = _color_valor(color)
+    if isinstance(valor, int):
+        return {"Index": valor}
+    r, g, b = valor["rgb"]
+    return {"Rgb": {"r": r, "g": g, "b": b}}
+
+
 class Modelo:
     """Sesion de dibujo sobre el documento abierto en OpenCADStudio."""
 
@@ -578,9 +604,11 @@ class Modelo:
         return None
 
     # -- capas ---------------------------------------------------------
-    def creaCapa(self, nombre: str, color: int = 2, tipo: str = "CONTINUOUS"):
-        """Crea la capa (color ACI + tipo de linea) o la reutiliza.
-        Si la capa ya existe NO toca ni su color ni su linetype.
+    def creaCapa(self, nombre: str, color: int = 2, tipo: str = "CONTINUOUS",
+                 grosor: float = None):
+        """Crea la capa (color ACI + tipo de linea + grosor) o la reutiliza.
+        Si la capa ya existe NO toca ni su color ni su linetype ni su grosor.
+        grosor: en mm (p. ej. 0.5); None lo deja sin definir (Default).
         """
         capas = self.mcp.tool(
             "ocs_read", {"ocs_session_id": self.sid, "op": "layers", "parameters": {}}
@@ -591,6 +619,8 @@ class Modelo:
 
         if tipo.upper() != "CONTINUOUS":
             self._exigir_tipo_cargado(tipo)
+        if grosor is not None:
+            _grosor_valor(grosor)  # valida antes de crear nada
         pasos = [
             {"op": "run", "document_id": self.doc_id, "cmd": f"LAYER NEW {nombre}"},
             {
@@ -608,6 +638,8 @@ class Modelo:
         print(f"Capa '{nombre}' creada (color ACI {color})")
         if tipo.upper() != "CONTINUOUS":
             self._fijar_tipo_linea_capa(nombre, tipo.upper())
+        if grosor is not None:
+            self._fijar_grosor_capa(nombre, grosor)
         self._refrescar_menu_capas(nombre)
 
     def _refrescar_menu_capas(self, nombre: str):
@@ -707,6 +739,41 @@ class Modelo:
         assert resp.get("status") == "completed", resp
         print(f"Capa '{nombre}': tipo de linea {actual} -> {tipo}")
 
+    def _fijar_grosor_capa(self, nombre: str, grosor: float):
+        """Fija el grosor de la capa via records (set_properties)."""
+        valor = {"Value": _grosor_valor(grosor)}
+        rec = self.mcp.tool(
+            "ocs_read",
+            {
+                "ocs_session_id": self.sid,
+                "op": "records",
+                "parameters": {"collection": "layers"},
+            },
+        )
+        capa = next(
+            (r for r in rec.get("records", []) if r.get("name") == nombre), None
+        )
+        if capa is None:
+            raise RuntimeError(f"No existe el record de capa '{nombre}'")
+        actual = capa["properties"].get("line_weight")
+        if actual == valor:
+            print(f"Capa '{nombre}': ya tiene grosor {valor['Value']} csmm")
+            return
+        resp = self.mcp.execute(
+            self.sid,
+            {
+                "op": "set_properties",
+                "request_id": self.mcp.nuevo_id("ej"),
+                "document_id": self.doc_id,
+                "collection": "layers",
+                "handle": capa["handle"],
+                "updates": [{"path": "/line_weight", "value": valor,
+                             "expected": actual}],
+            },
+        )
+        assert resp.get("status") == "completed", resp
+        print(f"Capa '{nombre}': grosor {actual} -> {valor['Value']} csmm")
+
     def asignaCapa(self, handles, capa: str):
         """Mueve entidades a la capa: select + property (campo 'layer')."""
         self.mcp.execute(
@@ -748,6 +815,161 @@ class Modelo:
             },
         )
         print(f"{len(_hs(handles))} entidades movidas a '{capa}'")
+
+    def _seleccion_actual(self):
+        st = self.mcp.tool(
+            "ocs_read", {"ocs_session_id": self.sid, "op": "state"}
+        )
+        return list(st.get("selection", []))
+
+    def _seleccion_limpiar(self):
+        self.mcp.execute(
+            self.sid,
+            {
+                "op": "select",
+                "request_id": self.mcp.nuevo_id("ej"),
+                "document_id": self.doc_id,
+                "clear": True,
+            },
+        )
+
+    def _seleccion_fijar(self, handles):
+        self.mcp.execute(
+            self.sid,
+            {
+                "op": "select",
+                "request_id": self.mcp.nuevo_id("ej"),
+                "document_id": self.doc_id,
+                "handles": _hs(handles),
+            },
+        )
+
+    def _aplicar_propiedades(self, handles, color=None, grosor=None, estilo=None,
+                             tolerante=False):
+        """Fija color/grosor/estilo propios de las entidades via records.
+
+        Lo que sea None no se escribe: la entidad hereda de la capa.
+        color: indice ACI (int) o tupla RGB. grosor: mm (p. ej. 0.5).
+        estilo: nombre de linetype cargado (p. ej. 'DASHED').
+        tolerante: salta con aviso lo que un elemento no admita (o no
+            exista) en vez de abortar; pensado para cambiar_propiedades.
+        Devuelve {"ok": [...], "saltadas": [(handle, motivo), ...]}.
+        """
+        hs = _hs(handles)
+        if color is None and grosor is None and estilo is None:
+            return {"ok": list(hs), "saltadas": []}
+        if estilo is not None and estilo.upper() not in ("CONTINUOUS", "BYLAYER"):
+            self._exigir_tipo_cargado(estilo)
+        valor_color = _color_record(color) if color is not None else None
+        valor_grosor = (
+            {"Value": _grosor_valor(grosor)} if grosor is not None else None
+        )
+        valor_estilo = estilo.upper() if estilo is not None else None
+        rec = self.mcp.tool(
+            "ocs_read",
+            {
+                "ocs_session_id": self.sid,
+                "op": "records",
+                "parameters": {"collection": "entities", "handles": hs},
+            },
+        )
+        actuales = {
+            r["handle"]: r["properties"]["common"] for r in rec.get("records", [])
+        }
+        ok, saltadas = [], []
+
+        def escribir(h, updates):
+            resp = self.mcp.execute(
+                self.sid,
+                {
+                    "op": "set_properties",
+                    "request_id": self.mcp.nuevo_id("ej"),
+                    "document_id": self.doc_id,
+                    "collection": "entities",
+                    "handle": h,
+                    "updates": updates,
+                },
+            )
+            assert resp.get("status") == "completed", resp
+
+        for h in hs:
+            comun = actuales.get(h)
+            if comun is None:
+                motivo = f"{h}: no existe el record de entidad"
+                if tolerante:
+                    print(f"  AVISO: {motivo}, se salta")
+                    saltadas.append((h, motivo))
+                    continue
+                raise RuntimeError(motivo)
+            updates = []
+            if valor_color is not None and comun.get("color") != valor_color:
+                updates.append({"path": "/common/color", "value": valor_color,
+                                "expected": comun.get("color")})
+            if valor_grosor is not None and comun.get("line_weight") != valor_grosor:
+                updates.append({"path": "/common/line_weight",
+                                "value": valor_grosor,
+                                "expected": comun.get("line_weight")})
+            if valor_estilo is not None and comun.get("linetype") != valor_estilo:
+                updates.append({"path": "/common/linetype", "value": valor_estilo,
+                                "expected": comun.get("linetype")})
+            if not updates:
+                ok.append(h)
+                continue
+            try:
+                escribir(h, updates)
+                ok.append(h)
+            except Exception as e:
+                if not tolerante:
+                    raise
+                # Reintento propiedad a propiedad: se salva lo admisible.
+                aplicadas = 0
+                for u in updates:
+                    try:
+                        escribir(h, [u])
+                        aplicadas += 1
+                    except Exception as e2:
+                        motivo = f"{h}: {u['path']} no admitido ({e2})"
+                        print(f"  AVISO: {motivo}, se salta")
+                        saltadas.append((h, motivo))
+                if aplicadas:
+                    ok.append(h)
+                elif not any(s[0] == h for s in saltadas):
+                    motivo = f"{h}: {e}"
+                    print(f"  AVISO: {motivo}, se salta")
+                    saltadas.append((h, motivo))
+        print(f"{len(ok)}/{len(hs)} entidades con propiedades propias "
+              f"(color={valor_color}, grosor={valor_grosor}, estilo={valor_estilo})")
+        return {"ok": ok, "saltadas": saltadas}
+
+    def cambiar_propiedades(self, handles, color=None, capa=None, grosor=None,
+                            estilo=None):
+        """Cambia color/capa/grosor/estilo de entidades existentes.
+
+        handles: uno o lista. capa: si no existe se crea (color 2).
+        Lo que sea None no se toca. Tolerante: lo que un elemento no
+        admita (o no exista) se salta con aviso y se sigue con el resto.
+        Devuelve {"ok": [...], "saltadas": [(handle, motivo), ...]}.
+        """
+        hs = _hs(handles)
+        if capa:
+            real = self._asegurar_capa(capa)
+            rec = self.mcp.tool(
+                "ocs_read",
+                {
+                    "ocs_session_id": self.sid,
+                    "op": "records",
+                    "parameters": {"collection": "entities", "handles": hs},
+                },
+            )
+            existen = {r["handle"] for r in rec.get("records", [])}
+            for h in hs:
+                if h not in existen:
+                    print(f"  AVISO: {h} no existe, se salta")
+            hs_capa = [h for h in hs if h in existen]
+            if hs_capa:
+                self.asignaCapa(hs_capa, real)
+        return self._aplicar_propiedades(hs, color, grosor, estilo,
+                                         tolerante=True)
 
     # -- modificar -----------------------------------------------------
     def _todos_handles(self):
@@ -1060,7 +1282,8 @@ class Modelo:
             return out
         raise ValueError(f"paralela: tipo {t} no soportado (Line, Polyline, Spline)")
 
-    def paralela(self, handle, distancia: float, capa: str = ""):
+    def paralela(self, handle, distancia: float, capa: str = "", color=None,
+                 grosor: float = None, estilo: str = None):
         """Crea una paralela geometrica a Line, Polyline o Spline.
 
         distancia > 0 -> a la DERECHA del sentido de la entidad;
@@ -1068,6 +1291,7 @@ class Modelo:
         Desplaza cada vertice por la normal local (deterministico y con
         el signo garantizado; no depende del kernel OFFSET). Devuelve la
         lista con el handle de la polilinea nueva.
+        color/grosor/estilo: None hereda la capa (ver polilinea).
         """
         d = float(distancia)
         if d != d or d in (float("inf"), float("-inf")):
@@ -1077,7 +1301,7 @@ class Modelo:
         h = _hs(handle)[0]
         pts = self._puntos_de(h)
         off = _offset_xy(pts, d)
-        nuevo = self.polilinea(off, capa)
+        nuevo = self.polilinea(off, capa, color, grosor, estilo)
         lado = "derecha" if d > 0 else "izquierda"
         print(f"Paralela de {h} a {lado} {abs(d):g} -> {nuevo}")
         return [nuevo]
@@ -1692,47 +1916,75 @@ class Modelo:
             raise RuntimeError(f"El batch no creo entidades: {resp}")
         return handles
 
-    def linea(self, p1: list, p2: list, capa: str = ""):
-        """Dibuja LINE p1->p2 (puntos [x, y] o [x, y, z]). Devuelve el handle."""
-        handles = self._corre_batch(
-            [
-                {
-                    "op": "run",
-                    "document_id": self.doc_id,
-                    "cmd": f"LINE {_fmt_punto(p1)} {_fmt_punto(p2)}",
-                }
-            ]
-        )
+    def linea(self, p1: list, p2: list, capa: str = "", color=None,
+              grosor: float = None, estilo: str = None):
+        """Dibuja LINE p1->p2 (puntos [x, y] o [x, y, z]). Devuelve el handle.
+
+        color/grosor/estilo fijan la propiedad propia de la entidad;
+        lo que sea None hereda de la capa. grosor en mm (p. ej. 0.5).
+
+        La seleccion se aparta antes de dibujar: OCS contagia a lo nuevo
+        el color/grosor/estilo de lo seleccionado.
+        """
+        previa = self._seleccion_actual()
+        self._seleccion_limpiar()
+        try:
+            handles = self._corre_batch(
+                [
+                    {
+                        "op": "run",
+                        "document_id": self.doc_id,
+                        "cmd": f"LINE {_fmt_punto(p1)} {_fmt_punto(p2)}",
+                    }
+                ]
+            )
+        finally:
+            if previa:
+                self._seleccion_fijar(previa)
         if capa:
             self.asignaCapa(handles, capa)
+        self._aplicar_propiedades(handles, color, grosor, estilo)
         return handles[0]
 
-    def polilinea(self, puntos: list, capa: str = ""):
+    def polilinea(self, puntos: list, capa: str = "", color=None,
+                  grosor: float = None, estilo: str = None):
         """Dibuja PLINE por los puntos. Devuelve el handle.
+
+        color/grosor/estilo fijan la propiedad propia de la entidad;
+        lo que sea None hereda de la capa. grosor en mm (p. ej. 0.5).
 
         Con >~200 vertices el diario de geometria (cap 256) expulsa la
         epoca inicial y changed_entities viene vacio aunque la entidad
         SI se crea: en ese caso se localiza por diff antes/despues.
+
+        La seleccion se aparta antes de dibujar: OCS contagia a lo nuevo
+        el color/grosor/estilo de lo seleccionado.
         """
         if len(puntos) < 2:
             raise ValueError("Polilinea necesita al menos 2 puntos")
         cmd = "PLINE " + " ".join(_fmt_punto(p) for p in puntos)
         antes = self._todos_handles()
-        resp = self.mcp.execute(
-            self.sid,
-            {
-                "op": "batch",
-                "request_id": self.mcp.nuevo_id("ej"),
-                "steps": [
-                    {
-                        "op": "run",
-                        "document_id": self.doc_id,
-                        "cmd": cmd,
-                    }
-                ],
-            },
-            detail="changed_entities",
-        )
+        previa = self._seleccion_actual()
+        self._seleccion_limpiar()
+        try:
+            resp = self.mcp.execute(
+                self.sid,
+                {
+                    "op": "batch",
+                    "request_id": self.mcp.nuevo_id("ej"),
+                    "steps": [
+                        {
+                            "op": "run",
+                            "document_id": self.doc_id,
+                            "cmd": cmd,
+                        }
+                    ],
+                },
+                detail="changed_entities",
+            )
+        finally:
+            if previa:
+                self._seleccion_fijar(previa)
         assert resp["status"] == "completed", resp
         assert resp["completed_steps"] == 1, resp
         handles = [e["handle"] for e in resp.get("changed_entities", [])]
@@ -1746,6 +1998,7 @@ class Modelo:
             print(f"  - Polyline handle={handles[0]} (localizada por diff)")
         if capa:
             self.asignaCapa(handles, capa)
+        self._aplicar_propiedades(handles, color, grosor, estilo)
         return handles[0]
 
     def poligono_relleno(self, puntos: list, capa: str, color):
@@ -2232,28 +2485,43 @@ class Modelo:
         self.creaCapa(nombre, color)
         return nombre
 
-    def circulo(self, centro: list, radio: float, capa: str = ""):
-        """Dibuja CIRCLE centro + radio. Devuelve el handle."""
+    def circulo(self, centro: list, radio: float, capa: str = "", color=None,
+                grosor: float = None, estilo: str = None):
+        """Dibuja CIRCLE centro + radio. Devuelve el handle.
+
+        color/grosor/estilo: None hereda la capa. La seleccion se aparta
+        antes de dibujar (OCS contagia lo seleccionado a lo nuevo).
+        """
         r = float(radio)
         if r != r or r in (float("inf"), float("-inf")) or r <= 0.0:
             raise ValueError(f"Radio {radio!r}: debe ser finito y > 0")
-        handles = self._corre_batch(
-            [
-                {
-                    "op": "run",
-                    "document_id": self.doc_id,
-                    "cmd": f"CIRCLE {_fmt_punto(centro)} {_fmt_num(r)}",
-                }
-            ]
-        )
+        previa = self._seleccion_actual()
+        self._seleccion_limpiar()
+        try:
+            handles = self._corre_batch(
+                [
+                    {
+                        "op": "run",
+                        "document_id": self.doc_id,
+                        "cmd": f"CIRCLE {_fmt_punto(centro)} {_fmt_num(r)}",
+                    }
+                ]
+            )
+        finally:
+            if previa:
+                self._seleccion_fijar(previa)
         if capa:
             self.asignaCapa(handles, self._asegurar_capa(capa))
+        self._aplicar_propiedades(handles, color, grosor, estilo)
         return handles[0]
 
-    def arco_3p(self, p1: list, p2: list, p3: list, capa: str = ""):
+    def arco_3p(self, p1: list, p2: list, p3: list, capa: str = "", color=None,
+                grosor: float = None, estilo: str = None):
         """Dibuja ARC por 3 puntos (inicial, intermedio, final).
 
         Rechaza puntos colineales (no definen un arco unico).
+        color/grosor/estilo: None hereda la capa. La seleccion se aparta
+        antes de dibujar (OCS contagia lo seleccionado a lo nuevo).
         Devuelve el handle.
         """
         pts = []
@@ -2263,17 +2531,24 @@ class Modelo:
         (x1, y1), (x2, y2), (x3, y3) = pts
         if abs((x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1)) < 1e-9:
             raise ValueError(f"Puntos colineales: {p1!r} {p2!r} {p3!r}")
-        handles = self._corre_batch(
-            [
-                {
-                    "op": "run",
-                    "document_id": self.doc_id,
-                    "cmd": f"ARC {_fmt_punto(p1)} {_fmt_punto(p2)} {_fmt_punto(p3)}",
-                }
-            ]
-        )
+        previa = self._seleccion_actual()
+        self._seleccion_limpiar()
+        try:
+            handles = self._corre_batch(
+                [
+                    {
+                        "op": "run",
+                        "document_id": self.doc_id,
+                        "cmd": f"ARC {_fmt_punto(p1)} {_fmt_punto(p2)} {_fmt_punto(p3)}",
+                    }
+                ]
+            )
+        finally:
+            if previa:
+                self._seleccion_fijar(previa)
         if capa:
             self.asignaCapa(handles, self._asegurar_capa(capa))
+        self._aplicar_propiedades(handles, color, grosor, estilo)
         return handles[0]
 
     def texto(
@@ -2285,6 +2560,9 @@ class Modelo:
         capa: str = "",
         justificacion: str = "",
         punto2: list | None = None,
+        color=None,
+        grosor: float = None,
+        estilo: str = None,
     ):
         """Crea TEXT guiado (justificacion/punto/altura/rotacion/editor).
 
@@ -2297,8 +2575,17 @@ class Modelo:
             ("centro", "derecha", ...). "" = justificar a la izquierda.
             "A"/"F" necesitan punto2 (alineacion en dos puntos).
         punto2: segundo punto para justificaciones Aligned/Fit.
+        color/grosor/estilo: None hereda la capa (se aplican a todas
+            las lineas creadas). La seleccion se aparta antes de
+            dibujar (OCS contagia lo seleccionado a lo nuevo).
         Devuelve el handle (una linea) o la lista de handles (varias).
         """
+        if estilo is not None and estilo.upper() not in ("CONTINUOUS", "BYLAYER"):
+            self._exigir_tipo_cargado(estilo)
+        if grosor is not None:
+            _grosor_valor(grosor)
+        if color is not None:
+            _color_record(color)
         if isinstance(cadena, str):
             lineas = cadena.splitlines()
         else:
@@ -2324,6 +2611,8 @@ class Modelo:
             if len(punto2) != 3:
                 raise ValueError(f"Punto2 {punto2!r}: 2 o 3 coordenadas")
         previos = self.textos_existentes()
+        previa = self._seleccion_actual()
+        self._seleccion_limpiar()
 
         def enviar(peticion, detail="full"):
             return self.mcp.execute(
@@ -2385,6 +2674,7 @@ class Modelo:
                         handles = self._ordenar_handles(nuevos)
                         if capa:
                             self.asignaCapa(handles, capa)
+                        self._aplicar_propiedades(handles, color, grosor, estilo)
                         return handles if multiple else handles[0]
                     continue
                 cmd = estado.get("command")
@@ -2465,6 +2755,8 @@ class Modelo:
                 resp = enviar(pet)
         finally:
             cancelar()
+            if previa:
+                self._seleccion_fijar(previa)
         raise RuntimeError("TEXT no termino en los pasos previstos.")
 
     # -- textos masivos (rapido) --------------------------------------
@@ -2475,6 +2767,9 @@ class Modelo:
         altura: float = 1,
         justificacion: str = "",
         verbose: bool = False,
+        color=None,
+        grosor: float = None,
+        estilo: str = None,
     ):
         """Crea muchos TEXT de una linea de forma rapida.
 
@@ -2482,6 +2777,9 @@ class Modelo:
             punto es [x, y] o [x, y, z].
         capa: si se indica, mueve TODOS los textos a esa capa al final
             (una sola operacion, no una por texto).
+        color/grosor/estilo: None hereda la capa (una sola pasada al
+            final). La seleccion se aparta antes de dibujar (OCS
+            contagia lo seleccionado a lo nuevo).
         Devuelve la lista de handles en orden de creacion.
 
         Cada texto cuesta 3 llamadas MCP (run + text_input + [commit,
@@ -2490,6 +2788,12 @@ class Modelo:
         items = list(items)
         if not items:
             return []
+        if estilo is not None and estilo.upper() not in ("CONTINUOUS", "BYLAYER"):
+            self._exigir_tipo_cargado(estilo)
+        if grosor is not None:
+            _grosor_valor(grosor)
+        if color is not None:
+            _color_record(color)
         just = self.JUSTIFICACIONES.get(justificacion.strip().upper(), "")
         if justificacion and not just:
             raise ValueError(
@@ -2502,17 +2806,24 @@ class Modelo:
         # Una sola sonda: el comando TEXT pide altura salvo en estilos de
         # altura fija (entonces se omite ese token).
         pide_altura = self._texto_pide_altura(items[0][1])
+        previa = self._seleccion_actual()
+        self._seleccion_limpiar()
         handles = []
-        for i, it in enumerate(items):
-            cadena, punto = it[0], it[1]
-            rot = it[2] if len(it) > 2 else 0
-            handles.append(
-                self._texto_rapido(cadena, punto, rot, altura, just, pide_altura)
-            )
-            if verbose and (i + 1) % 100 == 0:
-                print(f"  {i + 1}/{len(items)} textos...")
+        try:
+            for i, it in enumerate(items):
+                cadena, punto = it[0], it[1]
+                rot = it[2] if len(it) > 2 else 0
+                handles.append(
+                    self._texto_rapido(cadena, punto, rot, altura, just, pide_altura)
+                )
+                if verbose and (i + 1) % 100 == 0:
+                    print(f"  {i + 1}/{len(items)} textos...")
+        finally:
+            if previa:
+                self._seleccion_fijar(previa)
         if capa:
             self.asignaCapa(handles, capa)
+        self._aplicar_propiedades(handles, color, grosor, estilo)
         return handles
 
     def _texto_pide_altura(self, punto) -> bool:
@@ -2556,6 +2867,7 @@ class Modelo:
     def _texto_rapido(self, cadena, punto, rotacion, altura, just, pide_altura):
         """Un TEXT de una linea en 3 llamadas. Devuelve el handle."""
         base = {"document_id": self.doc_id}
+        antes = self._todos_handles()
         partes = ["TEXT"]
         if just and just != "L":  # L es la justificacion por defecto
             partes += ["J", just]
@@ -2615,6 +2927,12 @@ class Modelo:
         )
         sc = res.get("structuredContent", {})
         nuevos = [e["handle"] for e in sc.get("changed_entities", [])]
+        if not nuevos:
+            # Sin reporte (el commit no informa changed_entities aunque el
+            # texto SI se crea): localizar por diff, como en polilinea.
+            nuevos = self._ordenar_handles(self._todos_handles() - antes)
+            if nuevos:
+                print(f"  - Text handle={nuevos[-1]} (localizado por diff)")
         if not nuevos:
             raise RuntimeError(f"texto no creado: {json.dumps(sc)[:300]}")
         return nuevos[-1]

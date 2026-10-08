@@ -15,5 +15,5 @@ Uso:
 from .modelo import Modelo
 from .ocs import OcsMcp, OcsSessionError, elegir_sesion
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 __all__ = ["Modelo", "OcsMcp", "OcsSessionError", "elegir_sesion", "__version__"]

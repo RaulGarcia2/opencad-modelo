@@ -17,7 +17,7 @@ import os
 import time
 from decimal import Decimal
 
-from .ocs import OcsMcp, OcsSessionError, elegir_sesion
+from .ocs import OcsMcp, OcsSessionError, detalle_fallo, elegir_sesion
 
 BIN_POR_DEFECTO = "/usr/local/bin/opencad-studio"
 
@@ -542,32 +542,57 @@ class Modelo:
         )
         return {e["handle"] for e in q.get("entities", [])}
 
+    def _estado(self):
+        """Estado fresco de la sesion (documento, modal, editores...)."""
+        return self.mcp.tool(
+            "ocs_read", {"ocs_session_id": self.sid, "op": "state"}
+        )
+
     def _limpiar_restos(self, estado):
-        """Cierra un editor/comando dejado por una ejecucion interrumpida.
+        """Cierra un editor/comando/modal dejado por una ejecucion interrumpida.
 
         Si el proceso anterior murio a mitad de un TEXT (SIGTERM/SIGKILL no
         ejecutan el finally), el editor inline queda abierto y OCS reporta
-        waiting_input en TODA operacion posterior.
+        waiting_input en TODA operacion posterior. Igual pasa con un modal
+        (p. ej. el Rename) o con un comando a medias.
         """
-        if estado.get("text_editor"):
+        editores = (
+            ("text_editor", "editor de texto inline"),
+            ("mtext_editor", "editor MTEXT"),
+        )
+        for clave, etiqueta in editores:
+            if not estado.get(clave):
+                continue
+            print(f"AVISO: {etiqueta} abierto de una ejecucion anterior; lo cierro")
+            try:
+                self.mcp.execute(
+                    self.sid,
+                    {
+                        "op": "action",
+                        "request_id": self.mcp.nuevo_id("ej"),
+                        "document_id": self.doc_id,
+                        "name": "text_commit",
+                    },
+                )
+            except RuntimeError:
+                pass  # el editor puede haberse cerrado solo
+            estado = self._estado()
+
+        restos = [
+            (clave, etiqueta)
+            for clave, etiqueta in (
+                ("modal", f"modal {estado.get('modal')}"),
+                ("command", f"comando {estado.get('command')}"),
+                ("block_editor", "editor de bloque"),
+            )
+            if estado.get(clave)
+        ]
+        if restos:
             print(
-                "AVISO: editor de texto inline abierto de una ejecucion "
-                "anterior; lo cierro"
+                "AVISO: "
+                + ", ".join(etiqueta for _, etiqueta in restos)
+                + " de una ejecucion anterior; lo cancelo"
             )
-            self.mcp.execute(
-                self.sid,
-                {
-                    "op": "action",
-                    "request_id": self.mcp.nuevo_id("ej"),
-                    "document_id": self.doc_id,
-                    "name": "text_commit",
-                },
-            )
-            estado = self.mcp.tool(
-                "ocs_read", {"ocs_session_id": self.sid, "op": "state"}
-            )
-        if estado.get("command"):
-            print("AVISO: comando activo de una ejecucion anterior; lo cancelo")
             try:
                 self.mcp.execute(
                     self.sid,
@@ -579,6 +604,48 @@ class Modelo:
                 )
             except RuntimeError:
                 pass  # cancel devuelve status "cancelled" (no es fallo real)
+            estado = self._estado()
+
+        que_queda = [
+            etiqueta
+            for clave, etiqueta in (
+                ("modal", f"modal {estado.get('modal')}"),
+                ("command", f"comando {estado.get('command')}"),
+                ("text_editor", "editor de texto inline"),
+                ("mtext_editor", "editor MTEXT"),
+                ("block_editor", "editor de bloque"),
+            )
+            if estado.get(clave)
+        ]
+        if que_queda:
+            raise RuntimeError(
+                "No pude limpiar el estado de OCS: sigue abierto "
+                + ", ".join(que_queda)
+                + ". Cancelalo a mano en el dibujo y vuelve a intentarlo."
+            )
+
+    @staticmethod
+    def _exigir_ok(resp, contexto):
+        """Un op terminado. Si no, error legible (no el diccionario entero)."""
+        if resp.get("status") == "completed":
+            return resp
+        raise RuntimeError(f"{contexto} no completo: {detalle_fallo(resp)}")
+
+    @staticmethod
+    def _exigir_batch(resp, pasos, contexto):
+        """Un batch terminado entero: status, completed_steps y pasos."""
+        fallidos = [
+            r
+            for r in resp.get("results") or []
+            if r.get("ok") is False or r.get("status") not in (None, "completed")
+        ]
+        if (
+            resp.get("status") == "completed"
+            and resp.get("completed_steps") == pasos
+            and not fallidos
+        ):
+            return resp
+        raise RuntimeError(f"{contexto} no completo: {detalle_fallo(resp)}")
 
     def cerrar(self):
         self.mcp.cerrar()
@@ -633,51 +700,12 @@ class Modelo:
             self.sid,
             {"op": "batch", "request_id": self.mcp.nuevo_id("ej"), "steps": pasos},
         )
-        assert resp["status"] == "completed", resp
-        assert resp["completed_steps"] == len(pasos), resp
+        self._exigir_batch(resp, len(pasos), f"crear la capa '{nombre}'")
         print(f"Capa '{nombre}' creada (color ACI {color})")
         if tipo.upper() != "CONTINUOUS":
             self._fijar_tipo_linea_capa(nombre, tipo.upper())
         if grosor is not None:
             self._fijar_grosor_capa(nombre, grosor)
-        self._refrescar_menu_capas(nombre)
-
-    def _refrescar_menu_capas(self, nombre: str):
-        """Hace visible la capa en los menus de OCS.
-
-        LAYER NEW no reconstruye el espejo del panel/dropdown (a
-        diferencia de RENAME); un doble renombrado la refresca via MCP.
-        """
-        if any(ch.isspace() for ch in nombre):
-            print(f"AVISO: '{nombre}' con espacios: OCS la mostrara al reabrir")
-            return
-        tmp = f"{nombre}_tmp"
-        capas = self.mcp.tool(
-            "ocs_read", {"ocs_session_id": self.sid, "op": "layers", "parameters": {}}
-        )
-        if any(c["name"] == tmp for c in capas.get("layers", [])):
-            raise RuntimeError(f"Existe '{tmp}'; borrala o cambia el nombre")
-        for viejo, nuevo in ((nombre, tmp), (tmp, nombre)):
-            resp = self.mcp.execute(
-                self.sid,
-                {
-                    "op": "run",
-                    "request_id": self.mcp.nuevo_id("ej"),
-                    "document_id": self.doc_id,
-                    "cmd": f"RENAME LAYER {viejo} {nuevo}",
-                },
-            )
-            assert resp.get("status") == "completed", resp
-        rec = self.mcp.tool(
-            "ocs_read",
-            {
-                "ocs_session_id": self.sid,
-                "op": "records",
-                "parameters": {"collection": "layers"},
-            },
-        )
-        assert any(r.get("name") == nombre for r in rec.get("records", [])), nombre
-        print(f"Capa '{nombre}' visible en menus")
 
     def _exigir_tipo_cargado(self, tipo: str):
         """Falla claro si el linetype no esta cargado (no hay LOAD por MCP)."""
@@ -736,7 +764,7 @@ class Modelo:
                 "updates": [{"path": "/line_type", "value": tipo, "expected": actual}],
             },
         )
-        assert resp.get("status") == "completed", resp
+        self._exigir_ok(resp, f"fijar el tipo de linea de '{nombre}'")
         print(f"Capa '{nombre}': tipo de linea {actual} -> {tipo}")
 
     def _fijar_grosor_capa(self, nombre: str, grosor: float):
@@ -771,7 +799,7 @@ class Modelo:
                              "expected": actual}],
             },
         )
-        assert resp.get("status") == "completed", resp
+        self._exigir_ok(resp, f"fijar el grosor de '{nombre}'")
         print(f"Capa '{nombre}': grosor {actual} -> {valor['Value']} csmm")
 
     def asignaCapa(self, handles, capa: str):
@@ -890,7 +918,7 @@ class Modelo:
                     "updates": updates,
                 },
             )
-            assert resp.get("status") == "completed", resp
+            self._exigir_ok(resp, f"aplicar propiedades a {h}")
 
         for h in hs:
             comun = actuales.get(h)
@@ -1010,9 +1038,9 @@ class Modelo:
         """Crea varias entidades en un solo batch. Rapido (preview).
 
         figuras: lista de ("pline", puntos[, cerrar]) o
-        ("circulo", centro, radio). Con cerrar=True se duplica el
-        primer vertice: entities_create ignora is_closed, asi que el
-        cierre es visual (igual que hacia la app hasta ahora).
+        ("circulo", centro, radio). Con cerrar=True la polilinea se
+        cierra de verdad (entities_create acepta 'closed' desde
+        2026.44; antes solo se podia duplicar el primer vertice).
         La capa se asegura (existe o se crea). Inmune al contagio de
         la seleccion. Devuelve [handles] en orden.
         """
@@ -1027,13 +1055,8 @@ class Modelo:
                 co = [[float(p[0]), float(p[1])] for p in _pts]
                 if len(co) < 2:
                     raise ValueError("Polilinea necesita al menos 2 puntos")
-                if cerrar and (
-                    abs(co[0][0] - co[-1][0]) > 1e-9
-                    or abs(co[0][1] - co[-1][1]) > 1e-9
-                ):
-                    co.append(list(co[0]))
                 entidades.append({"type": "LwPolyline", "vertices": co,
-                                  "is_closed": bool(cerrar), "layer": real})
+                                  "closed": bool(cerrar), "layer": real})
             elif kind == "circulo":
                 centro, radio = fig[1], float(fig[2])
                 r = radio
@@ -1082,8 +1105,7 @@ class Modelo:
             self.sid,
             {"op": "batch", "request_id": self.mcp.nuevo_id("ej"), "steps": pasos},
         )
-        assert resp["status"] == "completed", resp
-        assert resp["completed_steps"] == len(pasos), resp
+        self._exigir_batch(resp, len(pasos), "modificar las entidades")
         return resp
 
     def _creados_despues(self, antes):
@@ -1297,7 +1319,8 @@ class Modelo:
             },
         )
         tipo = (q.get("entities") or [{}])[0].get("type")
-        assert tipo == "Spline", (tipo, q)
+        if tipo != "Spline":
+            raise RuntimeError(f"splinefit no creo una Spline: tipo {tipo!r}")
 
         if capa and capa != "0":
             self.asignaCapa([nuevo], capa)
@@ -1442,83 +1465,6 @@ class Modelo:
             f"(longitud {est[-1][2]:.3f})"
         )
         return [[x, y, z] for x, y, _ in est]
-
-    def puntos_curva(self, handle, paso: float):
-        """Puntos cada `paso` a lo largo de una curva (sin tocar el dibujo).
-
-        Line, Polyline (delega en puntos_polilinea), Circle, Arc,
-        Ellipse y Spline (fit_points por Catmull-Rom o control+knots
-        por NURBS exacta). Devuelve [[x, y, z], ...] con pk 0, paso,
-        2*paso... mas siempre el punto final; las cerradas (circulo,
-        elipse completa) repiten el primero al final.
-        """
-        _validar_paso(paso)
-        h = _hs(handle)[0]
-        rec = self.mcp.tool(
-            "ocs_read",
-            {"ocs_session_id": self.sid, "op": "records",
-             "parameters": {"collection": "entities", "handles": [h]}},
-        )
-        recs = rec.get("records", [])
-        if not recs:
-            raise ValueError(f"puntos_curva: la entidad {h} no existe")
-        tipo = str(recs[0].get("record_type", "")
-                   or recs[0].get("type", "")).upper()
-        props = recs[0].get("properties", {})
-        est, nombre = None, tipo
-        if "POLYLINE" in tipo:
-            return self.puntos_polilinea(h, paso)
-        if tipo == "LINE":
-            q = self.mcp.tool(
-                "ocs_read",
-                {"ocs_session_id": self.sid, "op": "query",
-                 "parameters": {"handles": [h], "detail": "geometry",
-                                "limit": 1}},
-            )
-            ents = q.get("entities", [])
-            if not ents:
-                raise ValueError(f"puntos_curva: la entidad {h} no existe")
-            s, e = _vec(ents[0]["start"]), _vec(ents[0]["end"])
-            est = _remuestrear([s, e], paso)
-            nombre = "Linea"
-        elif tipo == "CIRCLE":
-            c = _vec(props.get("center", [0, 0, 0]))
-            est = _circulo_estaciones(c, props.get("radius", 0), paso)
-            nombre = "Circulo"
-        elif tipo == "ARC":
-            c = _vec(props.get("center", [0, 0, 0]))
-            est = _arco_estaciones(c, props.get("radius", 0),
-                                   props.get("start_angle", 0),
-                                   props.get("end_angle", 0), paso)
-            nombre = "Arco"
-        elif tipo == "ELLIPSE":
-            c = _vec(props.get("center", [0, 0, 0]))
-            est = _elipse_estaciones(
-                c, _vec(props.get("major_axis", [1, 0, 0])),
-                props.get("minor_axis_ratio", 1.0),
-                props.get("start_parameter", 0.0),
-                props.get("end_parameter", 0.0), paso)
-            nombre = "Elipse"
-        elif tipo == "SPLINE":
-            modo, args = _fuente_spline(props)
-            if modo == "nurbs":
-                densa = _nurbs_muestrear(*args)
-            else:
-                densa = _catmull_rom_muestrear(*args)
-            cerrada = False
-            if len(densa) > 2 and math.hypot(
-                    densa[0][0] - densa[-1][0],
-                    densa[0][1] - densa[-1][1]) < 1e-9:
-                cerrada = True
-            est = _remuestrear(densa, paso, cerrada=cerrada)
-            nombre = "Spline"
-        else:
-            raise ValueError(
-                f"puntos_curva: {h} es {tipo or 'desconocido'} "
-                "(Line, Polyline, Circle, Arc, Ellipse, Spline)")
-        print(f"{nombre} {h}: {len(est)} puntos cada {paso} "
-              f"(longitud {est[-1][3]:.3f})")
-        return [[x, y, z] for x, y, z, _ in est]
 
     def puntos_curva(self, handle, paso: float, nativo: bool = True):
         """Puntos cada `paso` a lo largo de una curva.
@@ -1994,8 +1940,7 @@ class Modelo:
             {"op": "batch", "request_id": self.mcp.nuevo_id("ej"), "steps": pasos},
             detail=detalle,
         )
-        assert resp["status"] == "completed", resp
-        assert resp["completed_steps"] == len(pasos), resp
+        self._exigir_batch(resp, len(pasos), "dibujar por lotes")
         handles = [e["handle"] for e in resp.get("changed_entities", [])]
         for e in resp.get("changed_entities", []):
             print(f"  - {e['type']} handle={e['handle']} capa={e['layer']}")
@@ -2076,8 +2021,7 @@ class Modelo:
         finally:
             if previa:
                 self._seleccion_fijar(previa)
-        assert resp["status"] == "completed", resp
-        assert resp["completed_steps"] == 1, resp
+        self._exigir_batch(resp, 1, "dibujar la polilinea")
         handles = [e["handle"] for e in resp.get("changed_entities", [])]
         for e in resp.get("changed_entities", []):
             print(f"  - {e['type']} handle={e['handle']} capa={e['layer']}")
@@ -2256,27 +2200,23 @@ class Modelo:
     def bloque_desde_fichero(
         self, ruta, punto=None, escala=1.0, rotacion=0.0, recrear=False, insertar=False
     ):
-        """Crea un bloque a partir de un DWG/DXF externo (via -XREF Attach).
+        """Crea un bloque a partir de un DWG/DXF externo (via -INSERT).
 
         ruta: fichero .dwg o .dxf existente (se usa su ruta absoluta; el
-            bloque queda como referencia externa vinculada: no borres ni
-            muevas el fichero o la referencia quedara rota).
+            contenido queda incrustado en el dibujo como bloque normal,
+            sin referencia externa: el fichero deja de ser necesario).
         punto: insercion [x, y] o [x, y, z] (por defecto origen).
         escala: factor != 0. rotacion: grados.
-        ligar: si True, incrusta el contenido (Attach -> Explode del
-            inserto -> block_define -> Detach): no exige dibujo guardado
-            y el fichero externo deja de ser necesario. Si False (defecto),
-            queda como referencia externa vinculada.
-        recrear: si True y el bloque ya existe, lo elimina (Detach) y lo
-            vuelve a crear. Si False (defecto) y existe, reutiliza la
-            definicion e inserta una nueva referencia en punto/escala/
-            rotacion.
+        recrear: si True y el bloque ya existe, intenta eliminarlo y lo
+            vuelve a crear (si OCS no consigue borrarlo lo renombra y se
+            devuelve el nombre real). Si False (defecto) y existe,
+            reutiliza la definicion e inserta una nueva referencia en
+            punto/escala/rotacion.
         insertar: si False, solo define el bloque (borra el inserto
             automatico) y devuelve (nombre, None). La insercion queda
             para otro metodo.
         Devuelve (nombre_bloque, handle_insert o None). Reversible con Undo.
         """
-        ligar = True
         if punto is None:
             punto = [0, 0, 0]
         if not isinstance(ruta, str) or not ruta.strip():
@@ -2314,47 +2254,35 @@ class Modelo:
             except Exception:
                 pass
             existentes = self._nombres_bloques()
-        rot_txt = _fmt_num(rot)  # "0" -> "0.0": el 0 escueto lo rechaza XREF
+        rot_txt = _fmt_num(rot)
         bloques_antes = self._nombres_bloques()
         antes = self._todos_handles()
-        base = self.mcp.tool(
-            "ocs_execute",
+        # 2026.44: -INSERT carga el DWG como bloque normal (sin xref),
+        # asi que ya no hacen falta Attach + Explode + Detach: EXPLODE
+        # se niega a descomponer referencias externas ("no se
+        # seleccionaron objetos que puedan descomponerse"). Todos los
+        # prompts se contestan en linea (punto, escala X, escala Y y
+        # rotacion), asi que el run termina solo.
+        resp = self.mcp.execute(
+            self.sid,
             {
-                "ocs_session_id": self.sid,
-                "request": {
-                    "op": "run",
-                    "request_id": self.mcp.nuevo_id("ej"),
-                    "document_id": self.doc_id,
-                    "cmd": f"-XREF Attach {abspath} {_fmt_punto(punto)} {_fmt_num(esc)}",
-                },
-                "response_detail": "compact",
-                "wait_seconds": 5,
+                "op": "run",
+                "request_id": self.mcp.nuevo_id("ej"),
+                "document_id": self.doc_id,
+                "cmd": (
+                    f"-INSERT {abspath} {_fmt_punto(punto)} "
+                    f"{_fmt_num(esc)} {_fmt_num(esc)} {rot_txt}"
+                ),
             },
+            detail="compact",
         )
-        if base.get("status") != "completed":
-            # Se espera waiting_input en el angulo de rotacion (el run
-            # con la rotacion inline la rechaza si vale 0): se completa
-            # con input guiado, que si acepta el "0.0".
-            estado = self.mcp.tool(
-                "ocs_read", {"ocs_session_id": self.sid, "op": "state"}
-            )
-            cmd = estado.get("command") or {}
-            if "token" not in cmd.get("accepts", []):
-                raise RuntimeError(f"XREF no arranco: {base}")
-            r2 = self.mcp.execute(
-                self.sid,
-                {
-                    "op": "input",
-                    "request_id": self.mcp.nuevo_id("ej"),
-                    "document_id": self.doc_id,
-                    "kind": "token",
-                    "text": rot_txt,
-                },
-                detail="compact",
-            )
-            assert r2["status"] == "completed", r2
+        self._exigir_ok(resp, f"insertar {abspath} como bloque")
         nuevos_bloques = self._nombres_bloques() - bloques_antes
-        assert nuevos_bloques, f"XREF no creo bloque: {base}"
+        if not nuevos_bloques:
+            raise RuntimeError(
+                f"-INSERT no creo ningun bloque nuevo "
+                f"(ya habia {len(bloques_antes)})"
+            )
         nombre = sorted(nuevos_bloques)[0]
         nuevos = self._todos_handles() - antes
         tipos_ref = ("Insert", "Block Reference")
@@ -2376,11 +2304,13 @@ class Modelo:
             inserts = [
                 e["handle"] for e in q.get("entities", []) if e.get("type") in tipos_ref
             ]
-        assert inserts, (nombre, sorted(nuevos))
+        if not inserts:
+            raise RuntimeError(
+                f"-INSERT no creo inserto para '{nombre}': {sorted(nuevos)}"
+            )
         handle = self._ordenar_handles(inserts)[-1]
-        print(f"Bloque '{nombre}' desde {abspath} -> inserto {handle}")
-        if ligar:
-            return self._ligar_xref(nombre, handle, insertar)
+        if nombre.lower() != stem.lower():
+            print(f"AVISO: '{stem}' ya existia; OCS lo ha creado como '{nombre}'")
         if not insertar:
             self.mcp.execute(
                 self.sid,
@@ -2394,77 +2324,8 @@ class Modelo:
             )
             print(f"Bloque '{nombre}' definido (sin insertar).")
             return nombre, None
+        print(f"Bloque '{nombre}' desde {abspath} -> inserto {handle}")
         return nombre, handle
-
-    def _ligar_xref(self, nombre, handle, insertar=True):
-        """Incrusta un xref: Explode -> block_define -> Detach.
-
-        El contenido ya quedo transformado (punto/escala/rotacion del
-        Attach), asi que se redefine con ese mismo nombre y el inserto
-        conserva la colocacion. Con insertar=False se borra el inserto
-        automatico. Devuelve (nombre, handle|None).
-        """
-        antes = self._todos_handles()
-        resp = self.mcp.execute(
-            self.sid,
-            {
-                "op": "batch",
-                "request_id": self.mcp.nuevo_id("ej"),
-                "steps": [
-                    {"op": "select", "document_id": self.doc_id, "handles": [handle]},
-                    {"op": "run", "document_id": self.doc_id, "cmd": "EXPLODE"},
-                ],
-            },
-            detail="changed_entities",
-        )
-        assert resp["status"] == "completed", resp
-        assert resp["completed_steps"] == 2, resp
-        despues = self._todos_handles()
-        explotados = sorted(h for h in despues - antes if h in despues)
-        assert explotados, f"EXPLODE no produjo entidades: {resp}"
-        r2 = self.mcp.execute(
-            self.sid,
-            {
-                "op": "run",
-                "request_id": self.mcp.nuevo_id("ej"),
-                "document_id": self.doc_id,
-                "cmd": f"-XREF Detach {nombre}",
-            },
-            detail="compact",
-        )
-        assert r2["status"] == "completed", r2
-        quedan = [h for h in explotados if h in self._todos_handles()]
-        assert quedan, "Detach se llevo las entidades explotadas"
-        r3 = self.mcp.execute(
-            self.sid,
-            {
-                "op": "block_define",
-                "request_id": self.mcp.nuevo_id("ej"),
-                "document_id": self.doc_id,
-                "name": nombre,
-                "base": [0, 0, 0],
-                "handles": quedan,
-            },
-            detail="compact",
-        )
-        assert r3.get("status") == "completed", r3
-        nuevo = (r3.get("result") or {}).get("insert")
-        assert nuevo, r3
-        if not insertar:
-            self.mcp.execute(
-                self.sid,
-                {
-                    "op": "entities_delete",
-                    "request_id": self.mcp.nuevo_id("ej"),
-                    "document_id": self.doc_id,
-                    "handles": [nuevo],
-                },
-                detail="compact",
-            )
-            print(f"Bloque '{nombre}' ligado (incrustado, sin insertar).")
-            return nombre, None
-        print(f"Bloque '{nombre}' ligado (incrustado) -> inserto {nuevo}")
-        return nombre, nuevo
 
     def insertar_bloque(self, nombre, punto=None, escala=1.0, rotacion=0.0):
         """Inserta una referencia a un bloque existente del dibujo.
@@ -2496,8 +2357,11 @@ class Modelo:
         """Inserta una referencia a un bloque existente (flujo guiado).
 
         nombre: exacto de block_records. punto/escala/rotacion ya
-            validados. La escala/rotacion se aplican despues con
-            SCALE/ROTATE (evita los tokens de opcion del prompt).
+            validados. Se usa -INSERT: INSERT (sin guion) abre un
+            dialogo en 2026.44 y ya no deja nada que contestar por
+            MCP. Todos los prompts se contestan con input (nombre,
+            punto, escala X, escala Y y rotacion), asi que no hace
+            falta SCALE/ROTATE despues.
         Devuelve (nombre, handle_insert).
         """
         antes = self._todos_handles()
@@ -2507,13 +2371,13 @@ class Modelo:
                 "op": "start",
                 "request_id": self.mcp.nuevo_id("ej"),
                 "document_id": self.doc_id,
-                "cmd": "INSERT",
+                "cmd": "-INSERT",
             },
             detail="full",
         )
         cmd = (resp.get("state") or {}).get("command") or {}
         if "token" not in cmd.get("accepts", []):
-            raise RuntimeError(f"INSERT no arranco: {resp}")
+            raise RuntimeError(f"INSERT no arranco: {detalle_fallo(resp)}")
         for peticion in (
             {"op": "input", "kind": "token", "text": nombre},
             {
@@ -2526,6 +2390,9 @@ class Modelo:
                 ],
                 "space": "wcs",
             },
+            {"op": "input", "kind": "token", "text": _fmt_num(esc)},
+            {"op": "input", "kind": "token", "text": _fmt_num(esc)},
+            {"op": "input", "kind": "token", "text": _fmt_num(rot)},
         ):
             resp = self.mcp.execute(
                 self.sid,
@@ -2536,16 +2403,15 @@ class Modelo:
                 ),
                 detail="full",
             )
-        assert resp.get("status") == "completed", resp
+        self._exigir_ok(resp, f"insertar el bloque '{nombre}'")
         nuevos = self._todos_handles() - antes
         tipos_ref = ("Insert", "Block Reference")
         inserts = [h for h in nuevos if self._tipo_de(h) in tipos_ref]
-        assert inserts, sorted(nuevos)
+        if not inserts:
+            raise RuntimeError(
+                f"INSERT no creo inserto para '{nombre}': {sorted(nuevos)}"
+            )
         handle = self._ordenar_handles(inserts)[-1]
-        if esc != 1.0:
-            self.ampliar(handle, list(punto), esc)
-        if rot != 0.0:
-            self.rotar(handle, list(punto), rot)
         print(f"Insertado '{nombre}' en {punto} -> {handle}")
         return nombre, handle
 

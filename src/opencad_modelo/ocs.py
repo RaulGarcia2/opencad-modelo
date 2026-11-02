@@ -15,6 +15,48 @@ class OcsSessionError(RuntimeError):
     """
 
 
+# Tools del servidor MCP que esta libreria usa de verdad. El resto del
+# catalogo (ocs_query, ocs_render, ocs_measure...) es optativo y puede
+# aparecer o desaparecer entre versiones sin que nos afecte.
+TOOLS_REQUERIDAS = frozenset(
+    {"ocs_sessions", "ocs_read", "ocs_execute"}
+)
+
+
+def detalle_fallo(sc):
+    """Mensaje de error legible a partir del payload de un fallo.
+
+    En vez de escupir el diccionario entero, resume el ``code`` y el
+    ``error`` del conjunto, el paso de batch que fallo (si lo hay) y lo
+    que haya quedado abierto en el estado (modal, comando, editores).
+    """
+    partes = []
+    codigo = sc.get("code") or ""
+    texto = sc.get("error") or ""
+    if codigo or texto:
+        partes.append(f"{codigo} {texto}".strip())
+    for r in sc.get("results") or []:
+        if r.get("ok") is not False and r.get("status") in (None, "completed"):
+            continue
+        motivo = f"{r.get('code') or ''} {r.get('error') or ''}".strip()
+        partes.append(
+            f"paso {r.get('step')} ({r.get('op')}): {motivo or r.get('status')}"
+        )
+    estado = sc.get("state") or {}
+    for clave, etiqueta in (
+        ("modal", "modal abierto"),
+        ("command", "comando activo"),
+        ("text_editor", "editor de texto inline"),
+        ("mtext_editor", "editor MTEXT"),
+        ("block_editor", "editor de bloque"),
+    ):
+        if estado.get(clave):
+            partes.append(f"{etiqueta}: {estado[clave]}")
+    if not partes:
+        partes.append(json.dumps(sc, ensure_ascii=False)[:400])
+    return "; ".join(partes)
+
+
 class OcsMcp:
     def __init__(self, exe):
         try:
@@ -57,14 +99,58 @@ class OcsMcp:
         self.proc.stdin.flush()
 
     # -- herramientas ----------------------------------------------------
+    @staticmethod
+    def _desempaquetar(name, res):
+        """Devuelve el payload de una tools/call normalizado.
+
+        Desde 2026.44 una respuesta fallida trae ``structuredContent``
+        vacio y el JSON real en ``content[0].text``: aqui se lee siempre
+        el que haya, para no perder el codigo y el mensaje de error.
+        """
+        sc = res.get("structuredContent") or {}
+        if sc:
+            return sc
+        texto = "".join(c.get("text", "") for c in res.get("content") or [])
+        try:
+            cargado = json.loads(texto)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "code": "respuesta_invalida",
+                "error": (texto.strip() or "sin contenido")[:400],
+            }
+        if isinstance(cargado, dict):
+            return cargado
+        # Una lista u otro escalar no es un payload utilizable.
+        return {"ok": False, "code": "respuesta_invalida", "raw": cargado}
+
+    @staticmethod
+    def _es_stale(sc):
+        """True si la operacion fallo por estado desactualizado.
+
+        En ``op: "batch"`` el codigo viene dentro de ``results[].code``
+        y no en el nivel superior. Solo cuenta si TODOS los pasos
+        fallidos son ``stale_state``: si alguno avanzo, reintentar
+        duplicaria el trabajo ya hecho.
+        """
+        if sc.get("code") == "stale_state":
+            return True
+        resultados = sc.get("results") or []
+        fallas = [r for r in resultados if r.get("ok") is False]
+        return bool(fallas) and all(
+            r.get("code") == "stale_state" for r in fallas
+        )
+
     def tool(self, name, arguments, permitir_stale=False):
-        """Llama a una tool y devuelve su structuredContent (o lanza error)."""
+        """Llama a una tool y devuelve su payload (o lanza error)."""
         res = self._rpc("tools/call", {"name": name, "arguments": arguments})
-        sc = res.get("structuredContent", {})
-        if res.get("isError") or sc.get("ok") is False:
-            if permitir_stale and sc.get("code") == "stale_state":
-                return sc
-            raise RuntimeError(f"{name} fallo: {json.dumps(sc)}")
+        sc = self._desempaquetar(name, res)
+        if permitir_stale and self._es_stale(sc):
+            return sc
+        if sc.get("ok") is False or (
+            res.get("isError") and sc.get("ok") is not True
+        ):
+            raise RuntimeError(f"{name} fallo: {detalle_fallo(sc)}")
         return sc
 
     def handshake(self):
@@ -76,17 +162,21 @@ class OcsMcp:
                 "clientInfo": {"name": "ocs-ejemplo", "version": "1"},
             },
         )
-        print(f"Servidor: {init['serverInfo']['name']} {init['serverInfo']['version']}")
+        self.server = init["serverInfo"]
+        print(f"Servidor: {self.server['name']} {self.server['version']}")
         self._notify("notifications/initialized", {})
         tools = self._rpc("tools/list", {})
-        nombres = sorted(t["name"] for t in tools["tools"])
-        print(f"Tools: {', '.join(nombres)}")
-        assert set(nombres) == {
-            "ocs_sessions",
-            "ocs_read",
-            "ocs_execute",
-            "ocs_capture",
-        }, nombres
+        nombres = {t["name"] for t in tools["tools"]}
+        # El servidor amplia su catalogo con el tiempo (2026.44 expone 20
+        # tools): basta con que esten las que esta libreria usa.
+        faltan = sorted(TOOLS_REQUERIDAS - nombres)
+        if faltan:
+            raise RuntimeError(
+                f"El servidor no expone las tools necesarias: {faltan} "
+                f"(servidor {self.server['version']}, {len(nombres)} tools)"
+            )
+        usadas = ", ".join(sorted(TOOLS_REQUERIDAS & nombres))
+        print(f"Tools: {len(nombres)} disponibles (uso: {usadas})")
 
     def execute(
         self, session_id, request, detail="compact", wait=30.0, reintentos_stale=1
@@ -99,7 +189,7 @@ class OcsMcp:
             "wait_seconds": wait,
         }
         sc = self.tool("ocs_execute", args, permitir_stale=True)
-        if sc.get("code") == "stale_state" and reintentos_stale > 0:
+        if self._es_stale(sc) and reintentos_stale > 0:
             # Otro cliente toco el documento entre medias: refrescar y
             # reintentar UNA vez con un request_id nuevo.
             self.tool("ocs_read", {"ocs_session_id": session_id, "op": "state"})
@@ -109,7 +199,7 @@ class OcsMcp:
         if estado in ("accepted", "running"):
             sc = self._esperar_operacion(session_id, request["request_id"])
         if sc.get("ok") is False or sc.get("status") in ("failed", "cancelled"):
-            raise RuntimeError(f"Operacion fallo: {json.dumps(sc)}")
+            raise RuntimeError(f"Operacion fallo: {detalle_fallo(sc)}")
         return sc
 
     def _esperar_operacion(self, session_id, request_id, tope=30.0):

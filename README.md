@@ -14,7 +14,7 @@ O directamente desde GitHub (sin clonar):
 ```sh
 pip install "git+https://github.com/RaulGarcia2/opencad-modelo.git"
 # fijando versión:
-pip install "git+https://github.com/RaulGarcia2/opencad-modelo.git@v0.3.3"
+pip install "git+https://github.com/RaulGarcia2/opencad-modelo.git@v0.5.0"
 ```
 
 ## Uso
@@ -44,6 +44,10 @@ with Modelo() as m:                       # conecta con el dibujo en pantalla
 
 - OpenCADStudio instalado con su MCP (`opencad-studio --mcp`).
 - Un dibujo abierto en el editor.
+
+Probado con **OpenCADStudio 2026.44**. La librería solo exige las tools
+`ocs_sessions`, `ocs_read` y `ocs_execute`: si el servidor amplía su catálogo
+(como ha pasado con las 20 tools de 2026.44) sigue funcionando.
 
 La clase `Modelo` usa por defecto el ejecutable `/usr/local/bin/opencad-studio`;
 se puede cambiar con `Modelo(bin="/ruta/al/binario")`.

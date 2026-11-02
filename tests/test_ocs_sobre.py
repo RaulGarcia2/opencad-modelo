@@ -7,6 +7,8 @@ error. Ejecutar con:
 
     PYTHONPATH=../src python3 test_ocs_sobre.py
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -150,6 +152,22 @@ def test_handshake():
         assert "ocs_execute" in str(e), e
 
 
+def test_handshake_version_distinta():
+    # Otra version no corta: avisa y sigue (lo que manda es TOOLS_REQUERIDAS).
+    m = cliente([
+        {"serverInfo": {"name": "OpenCADStudio", "version": "2026.40"},
+         "protocolVersion": "2025-11-25"},
+        {"tools": [{"name": n} for n in TOOLS_2026_44]},
+    ])
+    salida = io.StringIO()
+    with contextlib.redirect_stdout(salida):
+        m.handshake()
+    assert m.server["version"] == "2026.40"
+    texto = salida.getvalue()
+    assert "AVISO" in texto, texto
+    assert "2026.40" in texto, texto
+
+
 def test_detalle_fallo():
     sc = {"ok": False, "status": "failed",
           "results": [{"step": 0, "op": "run", "ok": False,
@@ -218,6 +236,7 @@ if __name__ == "__main__":
     test_tool_stale()
     test_es_stale_batch()
     test_handshake()
+    test_handshake_version_distinta()
     test_detalle_fallo()
     test_exigir_batch()
     test_exigir_ok()

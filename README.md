@@ -43,14 +43,37 @@ with Modelo() as m:                       # conecta con el dibujo en pantalla
 ## Requisitos
 
 - OpenCADStudio instalado con su MCP (`opencad-studio --mcp`).
-- Un dibujo abierto en el editor.
+- Un dibujo abierto en el editor (`--mcp` se conecta al editor que ya está
+  en marcha; no abre uno nuevo).
 
-Probado con **OpenCADStudio 2026.44**. La librería solo exige las tools
+## Sin plugin y sin recompilar nada
+
+La librería habla con el servidor MCP que trae OpenCADStudio de serie: **no
+usa el plugin `opencad-python`** (el que ejecuta `PY_RUN` dentro del editor).
+Da igual que el editor arranque con `plugins: []` o que ese plugin se haya
+quedado desfasado tras una actualización: para dibujar desde Python aquí no
+hay que compilar ni instalar nada más.
+
+Solo hace falta la librería estándar de Python (no tiene dependencias) y un
+OpenCADStudio **2026.44** con sus tools MCP. La librería únicamente exige
 `ocs_sessions`, `ocs_read` y `ocs_execute`: si el servidor amplía su catálogo
-(como ha pasado con las 20 tools de 2026.44) sigue funcionando.
+(2026.44 expone 20 tools) se ignora el resto. Si la versión del servidor no es
+2026.44 se avisa y se continúa.
 
-La clase `Modelo` usa por defecto el ejecutable `/usr/local/bin/opencad-studio`;
-se puede cambiar con `Modelo(bin="/ruta/al/binario")`.
+## Dónde está el ejecutable
+
+`Modelo()` lo busca solo, en este orden:
+
+1. `Modelo(bin="/ruta/al/binario")`.
+2. La variable de entorno `OCS_BIN`.
+3. El `PATH` (`shutil.which`).
+4. Las rutas habituales: `/usr/local/bin`, `/usr/bin`, `/opt/opencad-studio`,
+   `~/.local/bin`, `~/bin`; en Windows `%LOCALAPPDATA%\Programs\OpenCADStudio`
+   y `Program Files`.
+
+Si no encuentra nada, el error lista todas las rutas probadas. `bin=` y
+`OCS_BIN` valen también para un comando con argumentos, p. ej.
+`OCS_BIN="flatpak run org.opencad.Studio"`.
 
 ## Licencia
 

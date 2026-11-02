@@ -13,7 +13,19 @@ Uso:
 """
 
 from .modelo import Modelo
-from .ocs import OcsMcp, OcsSessionError, elegir_sesion
+from .ocs import (
+    OcsMcp,
+    OcsSessionError,
+    elegir_sesion,
+    encontrar_binario,
+)
 
 __version__ = "0.5.0"
-__all__ = ["Modelo", "OcsMcp", "OcsSessionError", "elegir_sesion", "__version__"]
+__all__ = [
+    "Modelo",
+    "OcsMcp",
+    "OcsSessionError",
+    "__version__",
+    "elegir_sesion",
+    "encontrar_binario",
+]

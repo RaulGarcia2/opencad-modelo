@@ -17,9 +17,16 @@ import os
 import time
 from decimal import Decimal
 
-from .ocs import OcsMcp, OcsSessionError, detalle_fallo, elegir_sesion
+from .ocs import (
+    BIN_POR_DEFECTO,  # noqa: F401  (reexportado: se importa de aqui de siempre)
+    OcsMcp,
+    OcsSessionError,
+    detalle_fallo,
+    elegir_sesion,
+)
 
-BIN_POR_DEFECTO = "/usr/local/bin/opencad-studio"
+# BIN_POR_DEFECTO vive en .ocs (ruta tipica en Linux); Modelo ya no la
+# usa como valor fijo: el binario se busca solo.
 
 
 def _hs(handles):
@@ -498,7 +505,9 @@ def _color_record(color):
 class Modelo:
     """Sesion de dibujo sobre el documento abierto en OpenCADStudio."""
 
-    def __init__(self, bin=BIN_POR_DEFECTO):
+    def __init__(self, bin=None):
+        # bin=None: se busca el ejecutable solo (bin=, OCS_BIN, PATH y
+        # rutas habituales), asi funciona en cualquier instalacion.
         self.mcp = OcsMcp(bin)
         try:
             self.mcp.handshake()
